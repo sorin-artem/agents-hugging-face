@@ -1,0 +1,9 @@
+smolagents[litellm]
+plotly
+geopandas
+shapely
+kaleido
+python-dotenv
+requests
+markdownify
+plotly
