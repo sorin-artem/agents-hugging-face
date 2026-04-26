@@ -61,9 +61,11 @@ async def main() -> None:
     query_engine = index.as_query_engine(
         llm=llm,
         response_mode="tree_summarize",
+        similarity_top_k=10
+
     )
     response = query_engine.query(
-        "on which page i can find translation of the word 'key'?")
+        "on which page i can find translation of the word 'key'?",)
     print(response)
 
 if __name__ == "__main__":
