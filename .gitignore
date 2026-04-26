@@ -5,3 +5,9 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .DS_Store
+
+# Local database files
+alfred_chroma_db/
+*.db
+*.sqlite
+*.sqlite3
