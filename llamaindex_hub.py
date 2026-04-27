@@ -3,6 +3,9 @@ import asyncio
 from pathlib import Path
 
 import chromadb
+import llama_index.core
+from dotenv import load_dotenv
+from phoenix.otel import register
 from llama_index.core import Document, VectorStoreIndex
 from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.node_parser import SentenceSplitter
@@ -10,11 +13,37 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
 from llama_index.readers.file import PDFReader
 from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.core.evaluation import FaithfulnessEvaluator
+
+load_dotenv()
 
 INPUT_FILE = os.getenv("LLAMAINDEX_INPUT_FILE", "./2-razgovornik-dom.pdf")
 CHROMA_DB_PATH = "./alfred_chroma_db"
 CHROMA_COLLECTION = "alfred"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+PHOENIX_API_KEY = os.getenv("PHOENIX_API_KEY")
+PHOENIX_COLLECTOR_ENDPOINT = os.getenv(
+    "PHOENIX_COLLECTOR_ENDPOINT",
+    os.getenv("PHOENIX_ENDPOINT", "https://app.phoenix.arize.com"),
+).removesuffix("/v1/traces")
+PHOENIX_PROJECT_NAME = os.getenv("PHOENIX_PROJECT_NAME", "default")
+
+
+def configure_phoenix_tracing() -> None:
+    if not PHOENIX_API_KEY:
+        print("PHOENIX_API_KEY is not set. Skipping Phoenix tracing.")
+        return
+
+    os.environ["PHOENIX_API_KEY"] = PHOENIX_API_KEY
+    os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = PHOENIX_COLLECTOR_ENDPOINT
+
+    tracer_provider = register(
+        project_name=PHOENIX_PROJECT_NAME,
+    )
+    llama_index.core.set_global_handler(
+        "arize_phoenix",
+        tracer_provider=tracer_provider,
+    )
 
 
 def load_documents(input_file: str) -> list[Document]:
@@ -27,6 +56,8 @@ def load_documents(input_file: str) -> list[Document]:
 
 
 async def main() -> None:
+    configure_phoenix_tracing()
+
     db = chromadb.PersistentClient(path=CHROMA_DB_PATH)
     chroma_collection = db.get_or_create_collection(CHROMA_COLLECTION)
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
@@ -67,6 +98,9 @@ async def main() -> None:
     response = query_engine.query(
         "on which page i can find translation of the word 'key'?",)
     print(response)
+    evaluator = FaithfulnessEvaluator(llm=llm)
+    eval_result = evaluator.evaluate_response(response=response)
+    print(eval_result.passing)
 
 if __name__ == "__main__":
     asyncio.run(main())
