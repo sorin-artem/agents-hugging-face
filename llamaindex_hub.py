@@ -14,6 +14,9 @@ from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
 from llama_index.readers.file import PDFReader
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core.evaluation import FaithfulnessEvaluator
+from llama_index.core.tools import FunctionTool
+from llama_index.tools.google import GmailToolSpec
+from llama_index.core.agent.workflow import ReActAgent
 
 load_dotenv()
 
@@ -95,12 +98,52 @@ async def main() -> None:
         similarity_top_k=10
 
     )
-    response = query_engine.query(
-        "on which page i can find translation of the word 'key'?",)
+
+    def search_document(query: str) -> str:
+        """Search the PDF and return the answer with source page metadata."""
+        response = query_engine.query(query)
+        lines = [f"Answer: {response.response}", "", "Sources:"]
+
+        for source in response.source_nodes:
+            metadata = source.node.metadata
+            page = metadata.get("page_label", "unknown")
+            file_name = metadata.get("file_name", "unknown")
+            text = source.node.get_content().strip().replace("\n", " ")
+
+            lines.append(f"- file: {file_name}, page_label: {page}, score: {source.score}")
+            lines.append(f"  text: {text[:500]}")
+
+        return "\n".join(lines)
+
+    tool = FunctionTool.from_defaults(
+        fn=search_document,
+        name="search_document",
+        description=(
+            "Search the PDF document. Returns the answer, source text, "
+            "file name, page_label metadata, and retrieval scores."
+        ),
+    )
+    tool_spec = GmailToolSpec()
+    gmail_tools = tool_spec.to_tool_list()
+    tools = [tool]
+    agent = ReActAgent(
+        tools=tools,
+        llm=llm,
+        system_prompt=(
+            "You are a helpful assistant. Use tools when needed. "
+            "Write the final answer text in English."
+        ),
+    )
+    response = await agent.run(
+        user_msg=(
+            "Use the search_document tool. Find 'холодильник' in the document. "
+            "Answer with the Hebrew translation and the page number. "
+            "You must use page_label from the tool output. "
+            "Write the final response in English."
+        ))
     print(response)
-    evaluator = FaithfulnessEvaluator(llm=llm)
-    eval_result = evaluator.evaluate_response(response=response)
-    print(eval_result.passing)
+    print("\nTOOL CALLS:")
+    print(getattr(response, "tool_calls", None))
 
 if __name__ == "__main__":
     asyncio.run(main())
