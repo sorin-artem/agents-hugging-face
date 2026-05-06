@@ -1,6 +1,7 @@
 import os
 import asyncio
 from pathlib import Path
+import sys
 
 import chromadb
 import llama_index.core
@@ -17,6 +18,8 @@ from llama_index.core.evaluation import FaithfulnessEvaluator
 from llama_index.core.tools import FunctionTool
 from llama_index.tools.google import GmailToolSpec
 from llama_index.core.agent.workflow import ReActAgent
+from llama_index.core.workflow import Context
+from llama_index.tools.mcp import BasicMCPClient, McpToolSpec
 
 load_dotenv()
 
@@ -24,6 +27,8 @@ INPUT_FILE = os.getenv("LLAMAINDEX_INPUT_FILE", "./2-razgovornik-dom.pdf")
 CHROMA_DB_PATH = "./alfred_chroma_db"
 CHROMA_COLLECTION = "alfred"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+LOCAL_MCP_SERVER = Path(__file__).with_name("demo_mcp_server.py")
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL")
 PHOENIX_API_KEY = os.getenv("PHOENIX_API_KEY")
 PHOENIX_COLLECTOR_ENDPOINT = os.getenv(
     "PHOENIX_COLLECTOR_ENDPOINT",
@@ -56,6 +61,17 @@ def load_documents(input_file: str) -> list[Document]:
 
     print(f"Input file not found: {input_file!r}. Using Document.example().")
     return [Document.example()]
+
+
+async def load_local_mcp_tools():
+    """Expose MCP tools from a URL or from the bundled local server."""
+    if MCP_SERVER_URL:
+        mcp_client = BasicMCPClient(MCP_SERVER_URL)
+    else:
+        mcp_client = BasicMCPClient(sys.executable, args=[str(LOCAL_MCP_SERVER)])
+
+    mcp_tool = McpToolSpec(client=mcp_client)
+    return await mcp_tool.to_tool_list_async()
 
 
 async def main() -> None:
@@ -125,7 +141,10 @@ async def main() -> None:
     )
     tool_spec = GmailToolSpec()
     gmail_tools = tool_spec.to_tool_list()
-    tools = [tool]
+    mcp_tools = await load_local_mcp_tools()
+    print(f"Loaded MCP tools: {[mcp_tool.metadata.name for mcp_tool in mcp_tools]}")
+
+    tools = [tool, *mcp_tools]
     agent = ReActAgent(
         tools=tools,
         llm=llm,
@@ -134,13 +153,20 @@ async def main() -> None:
             "Write the final answer text in English."
         ),
     )
+    agent_context = Context(agent)
     response = await agent.run(
         user_msg=(
-            "Use the search_document tool. Find 'холодильник' in the document. "
-            "Answer with the Hebrew translation and the page number. "
-            "You must use page_label from the tool output. "
+            "Use the local MCP add tool to calculate 17 + 25. Use the local "
+            "MCP current_time tool to get the current time. Use the local MCP "
+            "echo tool with the message 'MCP tools are working'. Then use the "
+            "search_document tool to find 'холодильник' in the document. "
+            "Answer with the sum, the current time, the echoed message, "
+            "the Hebrew translation, and the page number. "
+            "For the page number, you must use page_label from the tool output. "
             "Write the final response in English."
-        ))
+        ),
+        ctx=agent_context,
+    )
     print(response)
     print("\nTOOL CALLS:")
     print(getattr(response, "tool_calls", None))
