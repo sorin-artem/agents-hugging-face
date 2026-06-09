@@ -18,3 +18,4 @@ arize-phoenix-otel
 llama-index-tools-google
 llama-index-tools-mcp
 mcp
+llama-index-utils-workflow
