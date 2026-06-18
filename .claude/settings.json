@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python3 -c \"import langchain_openai, langgraph; print\\('deps ok'\\)\")",
+      "Bash(.venv/bin/python3 -c \"import document_analysis_agent as d; print\\('import OK'\\); print\\('tools:', [t.__name__ if hasattr\\(t,'__name__'\\) else t.name for t in d.tools]\\)\")",
+      "Bash(.venv/bin/python3 -c ' *)",
+      "Bash(.venv/bin/python3 document_analysis_agent.py)"
+    ]
+  }
+}
