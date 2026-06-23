@@ -22,3 +22,7 @@ llama-index-utils-workflow
 langchain_openai
 langfuse
 langchain
+datasets
+langchain-community
+langchain-huggingface
+rank_bm25
