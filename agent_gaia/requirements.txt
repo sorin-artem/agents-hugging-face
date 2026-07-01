@@ -1,0 +1,8 @@
+ddgs
+gradio
+langgraph
+langsmith
+openai
+python-dotenv
+requests
+trafilatura
