@@ -21,17 +21,16 @@ GRAPH_HTML = """
 <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:16px 0;">
   <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">START</div>
   <div>→</div>
-  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">create_search_query</div>
+  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">decide_action</div>
   <div>→</div>
-  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">web_search</div>
+  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">execute_tool</div>
   <div>→</div>
-  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">choose_url</div>
-  <div>→</div>
-  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">fetch_url</div>
-  <div>→</div>
-  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">answer</div>
+  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">decide_action / final_answer</div>
   <div>→</div>
   <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">END</div>
+</div>
+<div style="font-size: 0.9em; opacity: 0.8;">
+  The agent loops between decide_action and execute_tool until it returns final_answer or reaches max steps.
 </div>
 """
 
