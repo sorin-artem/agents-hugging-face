@@ -9,31 +9,31 @@ from tools import search_url, web_search
 
 
 SEARCH_QUERY_PROMPT = """
-You are helping solve a GAIA benchmark question.
-Create one concise web search query that finds the authoritative source page needed to answer the question.
+You are helping answer a user question.
+Create one concise web search query that finds the authoritative source page needed to answer it.
 Do not copy the full question.
-Remove benchmark/task wording.
+Remove unnecessary instruction wording.
 Use keyword-style search, not a full sentence.
 Keep the main entity name exactly.
 Add the likely source page type when useful, such as discography, filmography, bibliography, official site, statistics, or archive.
 If the question requests English Wikipedia, prefer a query that targets the relevant Wikipedia article title, for example:
 Mercedes Sosa discography Wikipedia
 Do not over-constrain the query with dates if that makes the source page harder to find.
-Avoid queries that are likely to find copied benchmark questions or solution repositories.
+Avoid queries that are likely to find copied Q&A pages, answer keys, or solution repositories.
 Return only the search query, with no explanation.
 """
 
 CHOOSE_URL_PROMPT = """
-You are helping solve a GAIA benchmark question.
+You are helping answer a user question.
 Choose the single most useful URL from the web search results.
 Prefer authoritative primary sources, official pages, and Wikipedia when requested.
-Avoid benchmark leaks, copied questions, GitHub repos with solutions, and unrelated pages.
-If no result is relevant to the main entity and task, return NO_RELEVANT_URL.
+Avoid copied Q&A pages, answer keys, solution repositories, and unrelated pages.
+If no result is relevant to the main entity and question, return NO_RELEVANT_URL.
 Return only the URL or NO_RELEVANT_URL, with no explanation.
 """
 
 ANSWER_WITH_SEARCH_PROMPT = """
-You are a GAIA benchmark assistant.
+You are a general-purpose assistant.
 Use the provided web search results and fetched page content to answer the user's question.
 Return only the final answer.
 Do not include explanations.
