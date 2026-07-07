@@ -17,11 +17,27 @@ Rules:
 - If the question can be answered directly from the text, use final_answer.
 - Use web_search when external information is needed.
 - Use search_url only for authoritative, relevant URLs from prior observations.
+- Use analyze_image_attachment when the task has an attached image or asks about a picture, visual scene, or diagram.
+- When using analyze_image_attachment, pass the task_id, file_name if present, and the user's full visual question.
+- If image observations are already available and sufficient, use final_answer instead of calling analyze_image_attachment again.
 - Avoid copied Q&A pages, answer keys, solution repositories, and unrelated pages.
 - If search results are poor, use web_search again with a better keyword query.
 - Use exactly one tool call.
 - final_answer.answer must contain only the answer, not a sentence and not JSON.
+- Never call final_answer with an empty answer. If observations contain enough information, provide the best concise answer from them.
 """
+
+FINAL_ANSWER_PROMPT = """
+You are the final answer synthesizer for a general-purpose tool-using assistant.
+Use the question and previous observations to produce the best concise final answer.
+
+Rules:
+- Return only the final answer.
+- Do not include explanations, citations, JSON, or tool calls.
+- Never return an empty answer.
+- If the evidence is imperfect, return the best answer supported by the observations.
+"""
+
 
 def _openrouter_tool_schema(tool_name: str) -> dict[str, object]:
     langchain_tool = AGENT_TOOLS[tool_name]
@@ -36,8 +52,10 @@ def _openrouter_tool_schema(tool_name: str) -> dict[str, object]:
 
 
 ACTION_TOOLS = [
-    _openrouter_tool_schema("web_search"),
-    _openrouter_tool_schema("search_url"),
+    *[
+        _openrouter_tool_schema(tool_name)
+        for tool_name in AGENT_TOOLS
+    ],
     {
         "type": "function",
         "function": {
@@ -74,7 +92,13 @@ class GaiaState(TypedDict):
 
 
 class GaiaAgent:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        action_max_tokens: int | None = None,
+        answer_max_tokens: int | None = None,
+        max_steps: int | None = None,
+    ) -> None:
         api_key = os.getenv("OPEN_ROUTER_API_KEY")
         if not api_key:
             raise ValueError("Set OPEN_ROUTER_API_KEY.")
@@ -83,12 +107,13 @@ class GaiaAgent:
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
         )
-        self.model = os.getenv("OPENROUTER_MODEL", "z-ai/glm-5.2")
-        self.action_max_tokens = int(
+        self.model = model or os.getenv(
+            "OPENROUTER_MODEL", "google/gemini-2.5-pro")
+        self.action_max_tokens = action_max_tokens or int(
             os.getenv("OPENROUTER_ACTION_MAX_TOKENS", "512"))
-        self.answer_max_tokens = int(
+        self.answer_max_tokens = answer_max_tokens or int(
             os.getenv("OPENROUTER_ANSWER_MAX_TOKENS", "1024"))
-        self.max_steps = int(os.getenv("AGENT_MAX_STEPS", "8"))
+        self.max_steps = max_steps or int(os.getenv("AGENT_MAX_STEPS", "8"))
         self.graph = self._build_graph()
 
     def __call__(self, question: str) -> str:
@@ -157,12 +182,30 @@ class GaiaAgent:
 
         message = response.choices[0].message
         action, action_input = self._parse_model_message(message)
+        if action == "final_answer" and not action_input.get("answer", "").strip() and state["observations"]:
+            action_input["answer"] = self._synthesize_final_answer(state)
         return {
             "action": action,
             "action_input": action_input,
             "answer": action_input.get("answer", "") if action == "final_answer" else state["answer"],
             "steps": [*state["steps"], f"decide_action:{action}"],
         }
+
+    @traceable(name="synthesize_final_answer")
+    def _synthesize_final_answer(self, state: GaiaState) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": FINAL_ANSWER_PROMPT},
+                {
+                    "role": "user",
+                    "content": self._format_action_context(state),
+                },
+            ],
+            temperature=0,
+            max_tokens=self.answer_max_tokens,
+        )
+        return (response.choices[0].message.content or "").strip()
 
     def _format_action_context(self, state: GaiaState) -> str:
         observations = json.dumps(
@@ -209,7 +252,8 @@ class GaiaAgent:
         if action not in {*AGENT_TOOLS.keys(), "final_answer"}:
             return "final_answer", {"answer": ""}
 
-        normalized_input = {str(key): str(value) for key, value in action_input.items()}
+        normalized_input = {str(key): str(value)
+                            for key, value in action_input.items()}
         if action == "final_answer":
             answer = normalized_input.get("answer", "").strip()
             if answer.startswith("{") and answer.endswith("}"):
@@ -254,6 +298,8 @@ class GaiaAgent:
             observation = AGENT_TOOLS[action].invoke({"url": url})
             update["page_url"] = url
             update["page_content"] = observation
+        elif action in AGENT_TOOLS:
+            observation = AGENT_TOOLS[action].invoke(action_input)
         else:
             observation = f"Unknown action: {action}"
 
@@ -266,4 +312,3 @@ class GaiaAgent:
             },
         ]
         return update
-

@@ -1,5 +1,6 @@
 import os
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import gradio as gr
 import requests
@@ -12,79 +13,64 @@ from agent_langgraph import GaiaAgent
 load_dotenv()
 
 API_URL = "https://agents-course-unit4-scoring.hf.space"
-TASK_IDS = {
-    "Mercedes Sosa studio albums": "8e867cd7-cff9-4e6c-867a-ff5ddc2550be",
-    "Reversed text answer": "2d83110e-a098-4ebb-9987-066c06fa42d0",
-    "Wikipedia dinosaur featured article": "4fc2f1ae-8625-45b5-ab34-ad4433bc21f8",
-}
-GRAPH_HTML = """
-<div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:16px 0;">
-  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">START</div>
-  <div>→</div>
-  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">decide_action</div>
-  <div>→</div>
-  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">execute_tool</div>
-  <div>→</div>
-  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">decide_action / final_answer</div>
-  <div>→</div>
-  <div style="padding:12px 16px; border:1px solid #888; border-radius:8px;">END</div>
-</div>
-<div style="font-size: 0.9em; opacity: 0.8;">
-  The agent loops between decide_action and execute_tool until it returns final_answer or reaches max steps.
-</div>
-"""
-
-agent = GaiaAgent()
+DEFAULT_FILE_TASK_IDS = [
+    "cca530fc-4052-43b2-b130-b30968d8aa44",  # chess position image
+    # "99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3",  # recipe audio
+    # "f918266a-b3e0-4914-865d-4faa564f1aef",  # Python code file
+    # "1f975693-876d-457b-a649-393859e79bf3",  # homework audio
+    # "7bd855d8-463d-4ed5-93ca-5fe35145f733",  # Excel spreadsheet
+]
+CHECK_QUESTION_LIMIT = int(
+    os.getenv("CHECK_QUESTION_LIMIT", str(len(DEFAULT_FILE_TASK_IDS))))
+CHECK_MAX_WORKERS = int(
+    os.getenv("CHECK_MAX_WORKERS", str(CHECK_QUESTION_LIMIT)))
+CHECK_MODEL = os.getenv("CHECK_OPENROUTER_MODEL", "z-ai/glm-5.2")
+CHECK_ACTION_MAX_TOKENS = int(
+    os.getenv("CHECK_OPENROUTER_ACTION_MAX_TOKENS", "512"))
+CHECK_ANSWER_MAX_TOKENS = int(
+    os.getenv("CHECK_OPENROUTER_ANSWER_MAX_TOKENS", "512"))
+CHECK_MAX_STEPS = int(os.getenv("CHECK_AGENT_MAX_STEPS", "6"))
 
 
-def get_question(task_id: str) -> str:
-    return get_questions_by_id()[task_id]
-
-
-def get_questions_by_id() -> dict[str, str]:
+def get_questions() -> list[dict[str, str]]:
     response = requests.get(f"{API_URL}/questions", timeout=30)
     response.raise_for_status()
-    questions = response.json()
+    return response.json()
 
-    questions_by_id = {
-        item.get("task_id"): item.get("question", "")
-        for item in questions
-    }
-    missing_ids = [
-        task_id for task_id in TASK_IDS.values()
-        if task_id not in questions_by_id
+
+def get_check_questions() -> list[dict[str, str]]:
+    questions = [
+        item
+        for item in get_questions()
+        if item.get("task_id") and item.get("question")
     ]
-    if missing_ids:
-        raise ValueError(f"Questions not found: {', '.join(missing_ids)}")
+    questions_by_id = {str(item["task_id"]): item for item in questions}
+    preferred_task_ids = [
+        task_id.strip()
+        for task_id in os.getenv("CHECK_TASK_IDS", ",".join(DEFAULT_FILE_TASK_IDS)).split(",")
+        if task_id.strip()
+    ]
+    preferred_questions = [
+        questions_by_id[task_id]
+        for task_id in preferred_task_ids
+        if task_id in questions_by_id
+    ]
+    return preferred_questions[:CHECK_QUESTION_LIMIT]
 
-    return questions_by_id
+
+def question_label(item: dict[str, str], index: int) -> str:
+    task_id = str(item.get("task_id", ""))
+    return str(item.get("label") or item.get("name") or f"Question {index}: {task_id}")
 
 
-def format_questions_markdown() -> str:
-    questions_by_id = get_questions_by_id()
-    lines = ["## Selected Benchmark Questions"]
-    for index, (label, task_id) in enumerate(TASK_IDS.items(), start=1):
-        question = questions_by_id[task_id]
-        lines.append(f"{index}. **{label}**  \n`{task_id}`  \n{question}")
-    return "\n\n".join(lines)
+def build_agent_question(task_id: str, question: str, file_name: str = "") -> str:
+    metadata = [f"Task ID: {task_id}"]
+    if file_name:
+        metadata.append(f"Attached file: {file_name}")
+        metadata.append(
+            "Use the relevant file tool when the answer depends on this attachment.")
 
-
-def run_question_trace(task_label: str) -> tuple[str, str, str, str, str, str, str, str]:
-    task_id = TASK_IDS[task_label]
-    question = get_question(task_id)
-    result = agent.run(question)
-
-    steps = " -> ".join(result["steps"])
-    return (
-        task_id,
-        question,
-        steps,
-        result["search_query"],
-        result["search_results"],
-        result["page_url"],
-        result["page_content"],
-        result["answer"],
-    )
+    return "\n".join([*metadata, "", "Question:", question])
 
 
 def build_agent_code_url(agent_code: str) -> str:
@@ -98,15 +84,33 @@ def build_agent_code_url(agent_code: str) -> str:
     return "local-development"
 
 
+def create_check_agent() -> GaiaAgent:
+    return GaiaAgent(
+        model=CHECK_MODEL,
+        action_max_tokens=CHECK_ACTION_MAX_TOKENS,
+        answer_max_tokens=CHECK_ANSWER_MAX_TOKENS,
+        max_steps=CHECK_MAX_STEPS,
+    )
+
+
 @traceable(name="run_single_question")
-def run_single_question(label: str, task_id: str, question: str) -> dict[str, object]:
-    result = agent.run(question)
+def run_single_question(
+    label: str,
+    task_id: str,
+    question: str,
+    file_name: str = "",
+    agent: GaiaAgent | None = None,
+) -> dict[str, object]:
+    agent_question = build_agent_question(task_id, question, file_name)
+    result = (agent or create_check_agent()).run(agent_question)
     return {
         "label": label,
         "task_id": task_id,
+        "file_name": file_name,
         "question": question,
         "answer": result["answer"].strip(),
         "steps": result["steps"],
+        "observations": result["observations"],
         "search_query": result["search_query"],
         "search_results": result["search_results"],
         "page_url": result["page_url"],
@@ -114,12 +118,57 @@ def run_single_question(label: str, task_id: str, question: str) -> dict[str, ob
     }
 
 
-@traceable(name="run_all_questions")
-def run_all_questions(username: str, agent_code: str) -> dict[str, object]:
-    questions_by_id = get_questions_by_id()
+def failed_question_run(
+    label: str,
+    task_id: str,
+    question: str,
+    error: Exception,
+) -> dict[str, object]:
+    return {
+        "label": label,
+        "task_id": task_id,
+        "question": question,
+        "answer": "",
+        "steps": [f"error:{type(error).__name__}: {error}"],
+        "observations": [],
+        "search_query": "",
+        "search_results": "",
+        "page_url": "",
+        "page_content": "",
+    }
+
+
+def run_check_question(index: int, item: dict[str, str]) -> dict[str, object]:
+    label = question_label(item, index)
+    task_id = str(item["task_id"])
+    question = str(item["question"])
+    file_name = str(item.get("file_name", ""))
+    try:
+        return run_single_question(label, task_id, question, file_name)
+    except Exception as error:
+        return failed_question_run(label, task_id, question, error)
+
+
+@traceable(name="run_five_questions_parallel")
+def run_five_questions_parallel() -> dict[str, object]:
+    username = os.getenv("HF_USERNAME", "sorin-artem").strip()
+    agent_code = build_agent_code_url(os.getenv("AGENT_CODE_URL", ""))
+    questions = get_check_questions()
+    indexed_questions = list(enumerate(questions, start=1))
+    runs_by_index: dict[int, dict[str, object]] = {}
+
+    with ThreadPoolExecutor(max_workers=CHECK_MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(run_check_question, index, item): index
+            for index, item in indexed_questions
+        }
+        for future in as_completed(futures):
+            runs_by_index[futures[future]] = future.result()
+
     runs = [
-        run_single_question(label, task_id, questions_by_id[task_id])
-        for label, task_id in TASK_IDS.items()
+        runs_by_index[index]
+        for index, _item in indexed_questions
+        if index in runs_by_index
     ]
     answers_payload = [
         {
@@ -128,98 +177,56 @@ def run_all_questions(username: str, agent_code: str) -> dict[str, object]:
         }
         for run in runs
     ]
-
     payload = {
-        "username": username.strip(),
-        "agent_code": build_agent_code_url(agent_code),
+        "username": username,
+        "agent_code": agent_code,
         "answers": answers_payload,
     }
 
     response = requests.post(f"{API_URL}/submit", json=payload, timeout=60)
     response.raise_for_status()
     submission_result = response.json()
+    return {
+        "submission_result": submission_result,
+        "answers": answers_payload,
+        "runs": runs,
+        "settings": {
+            "model": CHECK_MODEL,
+            "question_limit": CHECK_QUESTION_LIMIT,
+            "max_workers": CHECK_MAX_WORKERS,
+            "action_max_tokens": CHECK_ACTION_MAX_TOKENS,
+            "answer_max_tokens": CHECK_ANSWER_MAX_TOKENS,
+            "max_steps": CHECK_MAX_STEPS,
+        },
+    }
+
+
+def run_and_check_five_questions() -> tuple[str, str]:
+    result = run_five_questions_parallel()
+    submission_result = result["submission_result"]
     status = (
         f"Score: {submission_result.get('score', 'N/A')}% "
         f"({submission_result.get('correct_count', '?')}/"
         f"{submission_result.get('total_attempted', '?')} correct)\n"
         f"Message: {submission_result.get('message', 'No message')}"
     )
-
-    return {
-        "status": status,
-        "submission_result": submission_result,
-        "answers": answers_payload,
-        "runs": runs,
-    }
-
-
-def run_and_submit_all(username: str, agent_code: str) -> tuple[str, str]:
-    if not username.strip():
-        return "Enter your Hugging Face username.", ""
-
-    result = run_all_questions(username, agent_code)
-    return (
-        str(result["status"]),
-        json.dumps(result["runs"], indent=2, ensure_ascii=False),
-    )
+    return status, json.dumps(result, indent=2, ensure_ascii=False)
 
 
 with gr.Blocks() as demo:
-    gr.Markdown("# GAIA Agent")
-    gr.Markdown("## Current LangGraph Workflow")
-    gr.HTML(GRAPH_HTML)
-    questions_markdown = gr.Markdown()
-    task_selector = gr.Dropdown(
-        label="Benchmark question",
-        choices=list(TASK_IDS.keys()),
-        value=next(iter(TASK_IDS)),
+    gr.Markdown("# General Tool Agent")
+    gr.Markdown(
+        "Runs selected questions in parallel, then submits the answers to the "
+        "Hugging Face scoring API."
     )
-    trace_button = gr.Button("Run selected question with trace")
-    trace_task_id_output = gr.Textbox(label="Task ID")
-    trace_question_output = gr.Textbox(label="Question", lines=5)
-    trace_steps_output = gr.Textbox(label="Executed steps")
-    trace_query_output = gr.Textbox(label="Search query")
-    trace_results_output = gr.Textbox(label="Search results", lines=10)
-    trace_url_output = gr.Textbox(label="Fetched URL")
-    trace_page_output = gr.Textbox(label="Fetched page content", lines=10)
-    trace_answer_output = gr.Textbox(label="Final answer")
-    trace_button.click(
-        fn=run_question_trace,
-        inputs=task_selector,
-        outputs=[
-            trace_task_id_output,
-            trace_question_output,
-            trace_steps_output,
-            trace_query_output,
-            trace_results_output,
-            trace_url_output,
-            trace_page_output,
-            trace_answer_output,
-        ],
-    )
-
-    gr.Markdown("## Check All 3 Answers")
-    username_input = gr.Textbox(
-        label="Hugging Face username",
-        value=os.getenv("HF_USERNAME", "sorin-artem"),
-    )
-    agent_code_input = gr.Textbox(
-        label="Agent code URL",
-        placeholder="Optional locally. In Space, SPACE_ID is used automatically.",
-    )
-    submit_button = gr.Button("Run all 3 and submit for checking")
+    submit_button = gr.Button("Run selected questions and check")
     submit_status_output = gr.Textbox(label="Check result", lines=3)
-    submit_log_output = gr.Code(label="Run log", language="json", lines=16)
+    submit_log_output = gr.Code(label="Run log", language="json", lines=20)
     submit_button.click(
-        fn=run_and_submit_all,
-        inputs=[
-            username_input,
-            agent_code_input,
-        ],
+        fn=run_and_check_five_questions,
+        inputs=None,
         outputs=[submit_status_output, submit_log_output],
     )
-    demo.load(fn=format_questions_markdown,
-              inputs=None, outputs=questions_markdown)
 
 
 if __name__ == "__main__":

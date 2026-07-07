@@ -1,5 +1,7 @@
 ddgs
+datasets
 gradio
+huggingface_hub
 langgraph
 langchain-core
 langsmith
