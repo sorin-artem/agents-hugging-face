@@ -1,6 +1,7 @@
 ddgs
 gradio
 langgraph
+langchain-core
 langsmith
 openai
 python-dotenv

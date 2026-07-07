@@ -201,7 +201,7 @@ with gr.Blocks() as demo:
     gr.Markdown("## Check All 3 Answers")
     username_input = gr.Textbox(
         label="Hugging Face username",
-        value=os.getenv("HF_USERNAME", ""),
+        value=os.getenv("HF_USERNAME", "sorin-artem"),
     )
     agent_code_input = gr.Textbox(
         label="Agent code URL",

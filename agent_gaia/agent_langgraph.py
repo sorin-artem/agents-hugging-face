@@ -6,17 +6,12 @@ from langgraph.graph import END, START, StateGraph
 from langsmith import traceable
 from openai import OpenAI
 
-from tools import search_url, web_search
+from tools import AGENT_TOOLS
 
 
 ACTION_PROMPT = """
 You are a general-purpose assistant that can use tools.
 Choose the next action needed to answer the user's question.
-
-Available actions:
-- web_search: search the web for relevant sources. Input: {"query": "..."}
-- search_url: read a specific URL. Input: {"url": "..."}
-- final_answer: finish with a concise answer. Input: {"answer": "..."}
 
 Rules:
 - If the question can be answered directly from the text, use final_answer.
@@ -24,12 +19,44 @@ Rules:
 - Use search_url only for authoritative, relevant URLs from prior observations.
 - Avoid copied Q&A pages, answer keys, solution repositories, and unrelated pages.
 - If search results are poor, use web_search again with a better keyword query.
-- Return only valid JSON with keys "action" and "action_input".
-- Do not include markdown or explanations.
-
-Example:
-{"action": "web_search", "action_input": {"query": "Mercedes Sosa discography Wikipedia"}}
+- Use exactly one tool call.
+- final_answer.answer must contain only the answer, not a sentence and not JSON.
 """
+
+def _openrouter_tool_schema(tool_name: str) -> dict[str, object]:
+    langchain_tool = AGENT_TOOLS[tool_name]
+    return {
+        "type": "function",
+        "function": {
+            "name": langchain_tool.name,
+            "description": langchain_tool.description,
+            "parameters": langchain_tool.args_schema.model_json_schema(),
+        },
+    }
+
+
+ACTION_TOOLS = [
+    _openrouter_tool_schema("web_search"),
+    _openrouter_tool_schema("search_url"),
+    {
+        "type": "function",
+        "function": {
+            "name": "final_answer",
+            "description": "Finish with the concise final answer.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "answer": {
+                        "type": "string",
+                        "description": "Only the final answer, with no explanation.",
+                    },
+                },
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
 
 
 class GaiaState(TypedDict):
@@ -124,10 +151,12 @@ class GaiaAgent:
             ],
             temperature=0,
             max_tokens=self.action_max_tokens,
+            tools=ACTION_TOOLS,
+            tool_choice="auto",
         )
 
-        raw_action = response.choices[0].message.content or ""
-        action, action_input = self._parse_action(raw_action)
+        message = response.choices[0].message
+        action, action_input = self._parse_model_message(message)
         return {
             "action": action,
             "action_input": action_input,
@@ -147,6 +176,22 @@ class GaiaAgent:
             f"Steps used: {state['step_count']}/{self.max_steps}"
         )
 
+    def _parse_model_message(self, message: object) -> tuple[str, dict[str, str]]:
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls:
+            tool_call = tool_calls[0]
+            function = getattr(tool_call, "function", None)
+            name = str(getattr(function, "name", "")).strip()
+            raw_arguments = str(getattr(function, "arguments", "{}"))
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                arguments = {}
+            return self._normalize_action(name, arguments)
+
+        raw_action = getattr(message, "content", None) or ""
+        return self._parse_action(str(raw_action))
+
     def _parse_action(self, raw_action: str) -> tuple[str, dict[str, str]]:
         try:
             parsed = json.loads(raw_action)
@@ -158,10 +203,22 @@ class GaiaAgent:
         if not isinstance(action_input, dict):
             action_input = {}
 
-        if action not in {"web_search", "search_url", "final_answer"}:
+        return self._normalize_action(action, action_input)
+
+    def _normalize_action(self, action: str, action_input: dict) -> tuple[str, dict[str, str]]:
+        if action not in {*AGENT_TOOLS.keys(), "final_answer"}:
             return "final_answer", {"answer": ""}
 
-        return action, {str(key): str(value) for key, value in action_input.items()}
+        normalized_input = {str(key): str(value) for key, value in action_input.items()}
+        if action == "final_answer":
+            answer = normalized_input.get("answer", "").strip()
+            if answer.startswith("{") and answer.endswith("}"):
+                nested_action, nested_input = self._parse_action(answer)
+                if nested_action != "final_answer" or nested_input.get("answer") != answer:
+                    return nested_action, nested_input
+            normalized_input["answer"] = answer
+
+        return action, normalized_input
 
     def _route_after_decision(self, state: GaiaState) -> str:
         if state["action"] == "final_answer":
@@ -189,12 +246,12 @@ class GaiaAgent:
 
         if action == "web_search":
             query = action_input.get("query", "").strip() or state["question"]
-            observation = web_search(query, max_results=8)
+            observation = AGENT_TOOLS[action].invoke({"query": query})
             update["search_query"] = query
             update["search_results"] = observation
         elif action == "search_url":
             url = action_input.get("url", "").strip()
-            observation = search_url(url)
+            observation = AGENT_TOOLS[action].invoke({"url": url})
             update["page_url"] = url
             update["page_content"] = observation
         else:

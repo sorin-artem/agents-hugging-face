@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 from ddgs import DDGS
+from langchain_core.tools import tool
 from trafilatura import extract, fetch_url
 
 
-def web_search(query: str, max_results: int = 5) -> str:
+MAX_PAGE_CHARS = 12000
+
+
+@tool
+def web_search(query: str) -> str:
+    """Search the web for relevant sources using a concise keyword query."""
     query = query.strip()
     if not query:
         return "No search query provided."
 
-    results = DDGS().text(query, max_results=max_results)
+    results = DDGS().text(query, max_results=8)
 
     if not results:
         return "No search results found."
@@ -24,7 +30,9 @@ def web_search(query: str, max_results: int = 5) -> str:
     return "\n\n".join(formatted_results)
 
 
-def search_url(url: str, max_chars: int = 12000) -> str:
+@tool
+def search_url(url: str) -> str:
+    """Read a specific URL and extract readable page text."""
     url = url.strip()
     if not url:
         return "No URL provided."
@@ -37,4 +45,10 @@ def search_url(url: str, max_chars: int = 12000) -> str:
     if not text:
         return f"Could not extract readable text from URL: {url}"
 
-    return text[:max_chars]
+    return text[:MAX_PAGE_CHARS]
+
+
+AGENT_TOOLS = {
+    web_search.name: web_search,
+    search_url.name: search_url,
+}
