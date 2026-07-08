@@ -10,33 +10,52 @@ from tools import AGENT_TOOLS
 
 
 ACTION_PROMPT = """
-You are a general-purpose assistant that can use tools.
-Choose the next action needed to answer the user's question.
+You are the router for a general-purpose tool-using assistant.
+Choose the next action needed to gather what is required to answer the question.
 
 Rules:
-- If the question can be answered directly from the text, use final_answer.
+- If the observations already contain enough information to answer, use final_answer.
+- A separate reasoning step computes the final answer, so you do not need to solve the task yourself.
 - Use web_search when external information is needed.
 - Use search_url only for authoritative, relevant URLs from prior observations.
+- Use run_python_attachment only when the attached file is a Python source file ending in .py and the task asks for its output or behavior.
+- Use analyze_document_attachment when the task has an attached PDF, spreadsheet, CSV, JSON, or text document.
 - Use analyze_image_attachment when the task has an attached image or asks about a picture, visual scene, or diagram.
+- When using run_python_attachment, pass the task_id and file_name if present.
+- When using analyze_document_attachment, pass the task_id, file_name if present, and the user's full document question.
 - When using analyze_image_attachment, pass the task_id, file_name if present, and the user's full visual question.
+- Never call run_python_attachment for .xlsx, .xlsm, .pdf, .csv, .json, image, or audio files.
 - If image observations are already available and sufficient, use final_answer instead of calling analyze_image_attachment again.
 - Avoid copied Q&A pages, answer keys, solution repositories, and unrelated pages.
 - If search results are poor, use web_search again with a better keyword query.
 - Use exactly one tool call.
-- final_answer.answer must contain only the answer, not a sentence and not JSON.
-- Never call final_answer with an empty answer. If observations contain enough information, provide the best concise answer from them.
+- final_answer.answer is optional; if you fill it, include only a short draft answer, never a sentence or JSON.
+"""
+
+REASONING_PROMPT = """
+You are a general-purpose reasoning agent.
+Given a question and the observations gathered by tools, work out the answer yourself.
+
+Rules:
+- Think step by step and show your reasoning explicitly.
+- Base every step only on the question and the observations; never invent facts.
+- Trust successful observations over tool errors; a later tool error does not invalidate earlier useful data.
+- If the observations are not enough to answer, state clearly what is missing instead of guessing.
 """
 
 FINAL_ANSWER_PROMPT = """
-You are the final answer synthesizer for a general-purpose tool-using assistant.
-Use the question and previous observations to produce the best concise final answer.
+You convert a reasoning trace into the final answer.
 
 Rules:
-- Return only the final answer.
-- Do not include explanations, citations, JSON, or tool calls.
-- Never return an empty answer.
-- If the evidence is imperfect, return the best answer supported by the observations.
+- Output only the final answer to the original question. No explanation, citations, JSON, or labels.
+- Follow exactly the format the question requests (for example a single number, a name, or algebraic notation).
+- Base the answer strictly on the provided reasoning.
+- If the reasoning concludes the task cannot be answered from the available information, return exactly: Unable to determine
 """
+
+
+class AgentError(RuntimeError):
+    """Raised when a required model step fails or returns no usable output."""
 
 
 def _openrouter_tool_schema(tool_name: str) -> dict[str, object]:
@@ -60,16 +79,16 @@ ACTION_TOOLS = [
         "type": "function",
         "function": {
             "name": "final_answer",
-            "description": "Finish with the concise final answer.",
+            "description": "Stop gathering information; a reasoning step will produce the answer.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "answer": {
                         "type": "string",
-                        "description": "Only the final answer, with no explanation.",
+                        "description": "Optional short draft answer, with no explanation.",
                     },
                 },
-                "required": ["answer"],
+                "required": [],
                 "additionalProperties": False,
             },
         },
@@ -82,6 +101,8 @@ class GaiaState(TypedDict):
     action: str
     action_input: dict[str, str]
     observations: list[dict[str, str]]
+    draft_answer: str
+    reasoning: str
     search_query: str
     search_results: str
     page_url: str
@@ -108,13 +129,35 @@ class GaiaAgent:
             base_url="https://openrouter.ai/api/v1",
         )
         self.model = model or os.getenv(
-            "OPENROUTER_MODEL", "google/gemini-2.5-pro")
-        self.action_max_tokens = action_max_tokens or int(
-            os.getenv("OPENROUTER_ACTION_MAX_TOKENS", "512"))
-        self.answer_max_tokens = answer_max_tokens or int(
-            os.getenv("OPENROUTER_ANSWER_MAX_TOKENS", "1024"))
+            "OPENROUTER_MODEL", "z-ai/glm-5.2")
+        # None means no cap: reasoning models need room to finish thinking before
+        # they emit any visible text, so by default we do not limit output tokens.
+        self.action_max_tokens = self._resolve_max_tokens(
+            action_max_tokens, "OPENROUTER_ACTION_MAX_TOKENS")
+        self.answer_max_tokens = self._resolve_max_tokens(
+            answer_max_tokens, "OPENROUTER_ANSWER_MAX_TOKENS")
         self.max_steps = max_steps or int(os.getenv("AGENT_MAX_STEPS", "8"))
+        # Reasoning models (e.g. z-ai/glm-5.2) can loop forever in their hidden
+        # reasoning channel on hard tasks and never emit visible content, burning
+        # the whole token budget for an empty answer. Keeping the hidden channel
+        # off makes the model reason in plain text (which we already ask for) and
+        # stop cleanly. Set OPENROUTER_REASONING=on to re-enable the hidden channel.
+        self.reasoning_enabled = os.getenv(
+            "OPENROUTER_REASONING", "off").strip().lower() in {
+                "1", "true", "on", "yes", "enabled"}
         self.graph = self._build_graph()
+
+    @staticmethod
+    def _resolve_max_tokens(value: int | None, env_name: str) -> int | None:
+        if value is not None:
+            return value
+        raw = os.getenv(env_name, "").strip().lower()
+        if raw in {"", "0", "none", "unlimited", "-1"}:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
 
     def __call__(self, question: str) -> str:
         result = self.run(question)
@@ -127,6 +170,8 @@ class GaiaAgent:
             "action": "",
             "action_input": {},
             "observations": [],
+            "draft_answer": "",
+            "reasoning": "",
             "search_query": "",
             "search_results": "",
             "page_url": "",
@@ -142,6 +187,7 @@ class GaiaAgent:
 
         workflow.add_node("decide_action", self._decide_action)
         workflow.add_node("execute_tool", self._execute_tool)
+        workflow.add_node("reason", self._reason)
 
         workflow.add_edge(START, "decide_action")
         workflow.add_conditional_edges(
@@ -149,7 +195,7 @@ class GaiaAgent:
             self._route_after_decision,
             {
                 "execute_tool": "execute_tool",
-                "end": END,
+                "reason": "reason",
             },
         )
         workflow.add_conditional_edges(
@@ -157,55 +203,157 @@ class GaiaAgent:
             self._route_after_tool,
             {
                 "decide_action": "decide_action",
-                "end": END,
+                "reason": "reason",
             },
         )
+        workflow.add_edge("reason", END)
 
         return workflow.compile()
 
+    def _chat(self, messages: list[dict[str, object]], *, max_tokens: int | None, step_name: str, **kwargs):
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        if not self.reasoning_enabled:
+            extra_body = dict(kwargs.get("extra_body") or {})
+            extra_body.setdefault("reasoning", {"enabled": False})
+            kwargs["extra_body"] = extra_body
+        try:
+            return self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0,
+                **kwargs,
+            )
+        except Exception as error:
+            raise AgentError(
+                f"{step_name} failed: model request error: {type(error).__name__}: {error}"
+            ) from error
+
+    def _complete_text(self, system_prompt: str, user_prompt: str, *, max_tokens: int, step_name: str) -> str:
+        response = self._chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=max_tokens,
+            step_name=step_name,
+        )
+        content = (response.choices[0].message.content or "").strip()
+        if not content:
+            raise AgentError(
+                f"{step_name} failed: model {self.model!r} returned no text output."
+            )
+        return content
+
     @traceable(name="decide_action")
     def _decide_action(self, state: GaiaState) -> dict[str, object]:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
+        response = self._chat(
+            [
                 {"role": "system", "content": ACTION_PROMPT},
-                {
-                    "role": "user",
-                    "content": self._format_action_context(state),
-                },
+                {"role": "user", "content": self._format_action_context(state)},
             ],
-            temperature=0,
             max_tokens=self.action_max_tokens,
+            step_name="Action decision step",
             tools=ACTION_TOOLS,
             tool_choice="auto",
         )
 
         message = response.choices[0].message
         action, action_input = self._parse_model_message(message)
-        if action == "final_answer" and not action_input.get("answer", "").strip() and state["observations"]:
-            action_input["answer"] = self._synthesize_final_answer(state)
+        if action in {
+            "run_python_attachment",
+            "analyze_document_attachment",
+            "analyze_image_attachment",
+        }:
+            action_input = self._with_attachment_args(
+                action,
+                action_input,
+                state["question"],
+            )
+        if action == "run_python_attachment" and not action_input.get("file_name", "").lower().endswith(".py"):
+            action = "final_answer"
+            action_input = {}
         return {
             "action": action,
             "action_input": action_input,
-            "answer": action_input.get("answer", "") if action == "final_answer" else state["answer"],
+            "draft_answer": action_input.get("answer", "").strip() if action == "final_answer" else "",
             "steps": [*state["steps"], f"decide_action:{action}"],
         }
 
-    @traceable(name="synthesize_final_answer")
-    def _synthesize_final_answer(self, state: GaiaState) -> str:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": FINAL_ANSWER_PROMPT},
-                {
-                    "role": "user",
-                    "content": self._format_action_context(state),
-                },
-            ],
-            temperature=0,
+    @traceable(name="reason")
+    def _reason(self, state: GaiaState) -> dict[str, object]:
+        reasoning = self._complete_text(
+            REASONING_PROMPT,
+            self._format_reasoning_context(state),
             max_tokens=self.answer_max_tokens,
+            step_name="Reasoning step",
         )
-        return (response.choices[0].message.content or "").strip()
+        answer = self._complete_text(
+            FINAL_ANSWER_PROMPT,
+            self._format_extract_context(state, reasoning),
+            max_tokens=self.answer_max_tokens,
+            step_name="Final answer step",
+        )
+        return {
+            "reasoning": reasoning,
+            "answer": answer,
+            "steps": [*state["steps"], "reason:final_answer"],
+        }
+
+    def _split_observations(
+        self,
+        state: GaiaState,
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        successful: list[dict[str, str]] = []
+        errors: list[dict[str, str]] = []
+        for observation in state["observations"]:
+            text = observation.get("observation", "")
+            if self._is_tool_error(text):
+                errors.append(observation)
+            else:
+                successful.append(observation)
+        return successful, errors
+
+    def _format_reasoning_context(self, state: GaiaState) -> str:
+        successful, errors = self._split_observations(state)
+        sections = [
+            f"Question:\n{state['question']}",
+            "Successful tool observations:\n"
+            + json.dumps(successful, ensure_ascii=False, indent=2),
+            "Tool errors (secondary context only):\n"
+            + json.dumps(errors, ensure_ascii=False, indent=2),
+        ]
+        draft = state.get("draft_answer", "").strip()
+        if draft:
+            sections.append(
+                "Preliminary draft answer from the router (unverified, may be wrong):\n"
+                + draft
+            )
+        sections.append(
+            "Reason step by step over the observations and determine the answer to the question."
+        )
+        return "\n\n".join(sections)
+
+    def _format_extract_context(self, state: GaiaState, reasoning: str) -> str:
+        return (
+            f"Original question:\n{state['question']}\n\n"
+            f"Reasoning trace:\n{reasoning}\n\n"
+            "Return only the final answer to the question, in exactly the requested format."
+        )
+
+    def _is_tool_error(self, text: str) -> bool:
+        error_markers = [
+            "failed:",
+            "error:",
+            "not supported",
+            "only supports",
+            "syntaxerror",
+            "timed out",
+            "could not",
+            "no local file was found",
+        ]
+        lowered = text.lower()
+        return any(marker in lowered for marker in error_markers)
 
     def _format_action_context(self, state: GaiaState) -> str:
         observations = json.dumps(
@@ -250,7 +398,7 @@ class GaiaAgent:
 
     def _normalize_action(self, action: str, action_input: dict) -> tuple[str, dict[str, str]]:
         if action not in {*AGENT_TOOLS.keys(), "final_answer"}:
-            return "final_answer", {"answer": ""}
+            return "final_answer", {}
 
         normalized_input = {str(key): str(value)
                             for key, value in action_input.items()}
@@ -266,17 +414,64 @@ class GaiaAgent:
 
     def _route_after_decision(self, state: GaiaState) -> str:
         if state["action"] == "final_answer":
-            return "end"
+            return "reason"
         if state["step_count"] >= self.max_steps:
-            return "end"
+            return "reason"
         return "execute_tool"
 
     def _route_after_tool(self, state: GaiaState) -> str:
-        if state["answer"]:
-            return "end"
         if state["step_count"] >= self.max_steps:
-            return "end"
+            return "reason"
         return "decide_action"
+
+    def _with_attachment_args(
+        self,
+        action: str,
+        action_input: dict[str, str],
+        question: str,
+    ) -> dict[str, str]:
+        # The model sometimes omits required attachment arguments; backfill them
+        # from the task text so a forgetful tool call still runs.
+        enriched = dict(action_input)
+        if not enriched.get("task_id", "").strip():
+            task_id = self._field_from_question(question, "task id")
+            if task_id:
+                enriched["task_id"] = task_id
+        if not enriched.get("file_name", "").strip():
+            file_name = self._field_from_question(question, "attached file")
+            if file_name:
+                enriched["file_name"] = file_name
+        needs_question = action in {
+            "analyze_document_attachment",
+            "analyze_image_attachment",
+        }
+        if needs_question and not enriched.get("question", "").strip():
+            enriched["question"] = self._question_body(question)
+        return enriched
+
+    @staticmethod
+    def _field_from_question(question: str, label: str) -> str:
+        for line in question.splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip().lower() == label:
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _question_body(question: str) -> str:
+        lines = question.splitlines()
+        for index, line in enumerate(lines):
+            if line.strip().lower().rstrip(":") == "question":
+                body = "\n".join(lines[index + 1:]).strip()
+                if body:
+                    return body
+        return question.strip()
+
+    def _invoke_tool(self, action: str, tool_input: dict[str, str]) -> str:
+        try:
+            return AGENT_TOOLS[action].invoke(tool_input)
+        except Exception as error:
+            return f"{action} failed: {type(error).__name__}: {error}"
 
     @traceable(name="execute_tool")
     def _execute_tool(self, state: GaiaState) -> dict[str, object]:
@@ -290,16 +485,26 @@ class GaiaAgent:
 
         if action == "web_search":
             query = action_input.get("query", "").strip() or state["question"]
-            observation = AGENT_TOOLS[action].invoke({"query": query})
+            observation = self._invoke_tool(action, {"query": query})
             update["search_query"] = query
             update["search_results"] = observation
         elif action == "search_url":
             url = action_input.get("url", "").strip()
-            observation = AGENT_TOOLS[action].invoke({"url": url})
+            observation = self._invoke_tool(action, {"url": url})
             update["page_url"] = url
             update["page_content"] = observation
         elif action in AGENT_TOOLS:
-            observation = AGENT_TOOLS[action].invoke(action_input)
+            if action in {
+                "run_python_attachment",
+                "analyze_document_attachment",
+                "analyze_image_attachment",
+            }:
+                action_input = self._with_attachment_args(
+                    action,
+                    action_input,
+                    state["question"],
+                )
+            observation = self._invoke_tool(action, action_input)
         else:
             observation = f"Unknown action: {action}"
 

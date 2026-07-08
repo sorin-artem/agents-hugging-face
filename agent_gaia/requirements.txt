@@ -6,6 +6,8 @@ langgraph
 langchain-core
 langsmith
 openai
+openpyxl
+pypdf
 python-dotenv
 requests
 trafilatura

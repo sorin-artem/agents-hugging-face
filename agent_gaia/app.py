@@ -13,22 +13,56 @@ from agent_langgraph import GaiaAgent
 load_dotenv()
 
 API_URL = "https://agents-course-unit4-scoring.hf.space"
+SUPPORTED_FILE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".py",
+    ".pdf",
+    ".xlsx",
+    ".xlsm",
+    ".csv",
+    ".tsv",
+    ".txt",
+    ".md",
+    ".json",
+    ".xml",
+}
+UNSUPPORTED_FILE_EXTENSIONS = {
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".flac",
+}
 DEFAULT_FILE_TASK_IDS = [
     "cca530fc-4052-43b2-b130-b30968d8aa44",  # chess position image
+    "f918266a-b3e0-4914-865d-4faa564f1aef",  # Python code file
+    "7bd855d8-463d-4ed5-93ca-5fe35145f733",  # Excel spreadsheet
     # "99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3",  # recipe audio
-    # "f918266a-b3e0-4914-865d-4faa564f1aef",  # Python code file
     # "1f975693-876d-457b-a649-393859e79bf3",  # homework audio
-    # "7bd855d8-463d-4ed5-93ca-5fe35145f733",  # Excel spreadsheet
 ]
 CHECK_QUESTION_LIMIT = int(
     os.getenv("CHECK_QUESTION_LIMIT", str(len(DEFAULT_FILE_TASK_IDS))))
 CHECK_MAX_WORKERS = int(
     os.getenv("CHECK_MAX_WORKERS", str(CHECK_QUESTION_LIMIT)))
 CHECK_MODEL = os.getenv("CHECK_OPENROUTER_MODEL", "z-ai/glm-5.2")
-CHECK_ACTION_MAX_TOKENS = int(
-    os.getenv("CHECK_OPENROUTER_ACTION_MAX_TOKENS", "512"))
-CHECK_ANSWER_MAX_TOKENS = int(
-    os.getenv("CHECK_OPENROUTER_ANSWER_MAX_TOKENS", "512"))
+
+
+def optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name, "").strip().lower()
+    if raw in {"", "0", "none", "unlimited", "-1"}:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+# None means no output-token cap (reasoning models need room to finish thinking).
+CHECK_ACTION_MAX_TOKENS = optional_int_env("CHECK_OPENROUTER_ACTION_MAX_TOKENS")
+CHECK_ANSWER_MAX_TOKENS = optional_int_env("CHECK_OPENROUTER_ANSWER_MAX_TOKENS")
 CHECK_MAX_STEPS = int(os.getenv("CHECK_AGENT_MAX_STEPS", "6"))
 
 
@@ -38,6 +72,38 @@ def get_questions() -> list[dict[str, str]]:
     return response.json()
 
 
+def file_extension(file_name: str) -> str:
+    return os.path.splitext(file_name.strip())[1].lower()
+
+
+def is_supported_file_question(item: dict[str, str]) -> bool:
+    file_name = str(item.get("file_name", ""))
+    return bool(file_name) and file_extension(file_name) in SUPPORTED_FILE_EXTENSIONS
+
+
+def sort_file_questions(questions: list[dict[str, str]]) -> list[dict[str, str]]:
+    preferred_order = {
+        task_id: index
+        for index, task_id in enumerate(DEFAULT_FILE_TASK_IDS)
+    }
+    return sorted(
+        questions,
+        key=lambda item: (
+            preferred_order.get(str(item.get("task_id", "")), len(preferred_order)),
+            str(item.get("file_name", "")),
+        ),
+    )
+
+
+def get_supported_file_questions() -> list[dict[str, str]]:
+    questions = [
+        item
+        for item in get_questions()
+        if item.get("task_id") and item.get("question") and is_supported_file_question(item)
+    ]
+    return sort_file_questions(questions)
+
+
 def get_check_questions() -> list[dict[str, str]]:
     questions = [
         item
@@ -45,17 +111,55 @@ def get_check_questions() -> list[dict[str, str]]:
         if item.get("task_id") and item.get("question")
     ]
     questions_by_id = {str(item["task_id"]): item for item in questions}
-    preferred_task_ids = [
-        task_id.strip()
-        for task_id in os.getenv("CHECK_TASK_IDS", ",".join(DEFAULT_FILE_TASK_IDS)).split(",")
-        if task_id.strip()
+    check_task_ids = os.getenv("CHECK_TASK_IDS", "").strip()
+    if check_task_ids:
+        preferred_task_ids = [
+            task_id.strip()
+            for task_id in check_task_ids.split(",")
+            if task_id.strip()
+        ]
+        preferred_questions = [
+            questions_by_id[task_id]
+            for task_id in preferred_task_ids
+            if task_id in questions_by_id
+        ]
+        return preferred_questions[:CHECK_QUESTION_LIMIT]
+
+    return get_supported_file_questions()[:CHECK_QUESTION_LIMIT]
+
+
+def summarize_file_questions() -> str:
+    supported = get_supported_file_questions()
+    all_file_questions = [
+        item
+        for item in get_questions()
+        if item.get("task_id") and item.get("question") and item.get("file_name")
     ]
-    preferred_questions = [
-        questions_by_id[task_id]
-        for task_id in preferred_task_ids
-        if task_id in questions_by_id
+    unsupported = [
+        item
+        for item in all_file_questions
+        if file_extension(str(item.get("file_name", ""))) in UNSUPPORTED_FILE_EXTENSIONS
     ]
-    return preferred_questions[:CHECK_QUESTION_LIMIT]
+    selected = supported[:CHECK_QUESTION_LIMIT]
+    lines = [
+        f"Selected supported file tasks: {len(selected)}/{len(supported)}",
+        f"Skipped unsupported audio tasks: {len(unsupported)}",
+        "",
+    ]
+    for index, item in enumerate(selected, start=1):
+        question = str(item.get("question", "")).replace("\n", " ")
+        lines.append(
+            f"{index}. {item.get('task_id')} | {item.get('file_name')} | {question[:140]}"
+        )
+    if unsupported:
+        lines.extend(["", "Unsupported audio tasks:"])
+        for item in unsupported:
+            lines.append(f"- {item.get('task_id')} | {item.get('file_name')}")
+    return "\n".join(lines)
+
+
+def preview_file_tasks() -> tuple[str, str]:
+    return "File task preview loaded.", summarize_file_questions()
 
 
 def question_label(item: dict[str, str], index: int) -> str:
@@ -109,6 +213,7 @@ def run_single_question(
         "file_name": file_name,
         "question": question,
         "answer": result["answer"].strip(),
+        "reasoning": result.get("reasoning", ""),
         "steps": result["steps"],
         "observations": result["observations"],
         "search_query": result["search_query"],
@@ -123,12 +228,15 @@ def failed_question_run(
     task_id: str,
     question: str,
     error: Exception,
+    file_name: str = "",
 ) -> dict[str, object]:
     return {
         "label": label,
         "task_id": task_id,
+        "file_name": file_name,
         "question": question,
         "answer": "",
+        "reasoning": "",
         "steps": [f"error:{type(error).__name__}: {error}"],
         "observations": [],
         "search_query": "",
@@ -146,11 +254,11 @@ def run_check_question(index: int, item: dict[str, str]) -> dict[str, object]:
     try:
         return run_single_question(label, task_id, question, file_name)
     except Exception as error:
-        return failed_question_run(label, task_id, question, error)
+        return failed_question_run(label, task_id, question, error, file_name)
 
 
-@traceable(name="run_five_questions_parallel")
-def run_five_questions_parallel() -> dict[str, object]:
+@traceable(name="run_file_questions_parallel")
+def run_file_questions_parallel() -> dict[str, object]:
     username = os.getenv("HF_USERNAME", "sorin-artem").strip()
     agent_code = build_agent_code_url(os.getenv("AGENT_CODE_URL", ""))
     questions = get_check_questions()
@@ -201,8 +309,8 @@ def run_five_questions_parallel() -> dict[str, object]:
     }
 
 
-def run_and_check_five_questions() -> tuple[str, str]:
-    result = run_five_questions_parallel()
+def run_and_check_file_questions() -> tuple[str, str]:
+    result = run_file_questions_parallel()
     submission_result = result["submission_result"]
     status = (
         f"Score: {submission_result.get('score', 'N/A')}% "
@@ -216,14 +324,20 @@ def run_and_check_five_questions() -> tuple[str, str]:
 with gr.Blocks() as demo:
     gr.Markdown("# General Tool Agent")
     gr.Markdown(
-        "Runs selected questions in parallel, then submits the answers to the "
-        "Hugging Face scoring API."
+        "Runs supported file-attachment tasks in parallel, then submits the answers "
+        "to the Hugging Face scoring API. Audio tasks are skipped for now."
     )
-    submit_button = gr.Button("Run selected questions and check")
+    preview_button = gr.Button("Preview supported file tasks")
+    submit_button = gr.Button("Run supported file tasks and check")
     submit_status_output = gr.Textbox(label="Check result", lines=3)
     submit_log_output = gr.Code(label="Run log", language="json", lines=20)
+    preview_button.click(
+        fn=preview_file_tasks,
+        inputs=None,
+        outputs=[submit_status_output, submit_log_output],
+    )
     submit_button.click(
-        fn=run_and_check_five_questions,
+        fn=run_and_check_file_questions,
         inputs=None,
         outputs=[submit_status_output, submit_log_output],
     )
