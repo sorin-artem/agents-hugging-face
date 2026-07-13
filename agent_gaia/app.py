@@ -60,7 +60,9 @@ def optional_int_env(name: str) -> int | None:
         return None
 
 
-# None means no output-token cap (reasoning models need room to finish thinking).
+# None here means "unset" — the agent then falls back to its own generous default
+# ceiling. It does NOT mean unlimited output (the provider truncates long reasoning
+# when no cap is sent). Set the env to a number to override, or "none" to opt out.
 CHECK_ACTION_MAX_TOKENS = optional_int_env("CHECK_OPENROUTER_ACTION_MAX_TOKENS")
 CHECK_ANSWER_MAX_TOKENS = optional_int_env("CHECK_OPENROUTER_ANSWER_MAX_TOKENS")
 CHECK_MAX_STEPS = int(os.getenv("CHECK_AGENT_MAX_STEPS", "6"))

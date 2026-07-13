@@ -18,6 +18,7 @@ Rules:
 - A separate reasoning step computes the final answer, so you do not need to solve the task yourself.
 - Use web_search when external information is needed.
 - Use search_url only for authoritative, relevant URLs from prior observations.
+- If an attached file has already been successfully analyzed and the question does not explicitly require external/current/web information, use final_answer instead of web_search.
 - Use run_python_attachment only when the attached file is a Python source file ending in .py and the task asks for its output or behavior.
 - Use analyze_document_attachment when the task has an attached PDF, spreadsheet, CSV, JSON, or text document.
 - Use analyze_image_attachment when the task has an attached image or asks about a picture, visual scene, or diagram.
@@ -47,9 +48,11 @@ FINAL_ANSWER_PROMPT = """
 You convert a reasoning trace into the final answer.
 
 Rules:
-- Output only the final answer to the original question. No explanation, citations, JSON, or labels.
+- Output only the final answer to the original question, on a single line and nothing else. No explanation, citations, JSON, labels, or markdown.
 - Follow exactly the format the question requests (for example a single number, a name, or algebraic notation).
-- Base the answer strictly on the provided reasoning.
+- For numbers, do not use thousands separators: write 89706.00, not 89,706.00, unless the question explicitly asks for them.
+- Base the answer strictly on the provided reasoning. Do not redo, extend, or second-guess the calculation, and never write filler like "Let me", "I need to", or "from where the reasoning left off".
+- If the reasoning is cut off just before the last trivial step, finish that step silently and output only the resulting value.
 - If the reasoning concludes the task cannot be answered from the available information, return exactly: Unable to determine
 """
 
@@ -130,12 +133,15 @@ class GaiaAgent:
         )
         self.model = model or os.getenv(
             "OPENROUTER_MODEL", "z-ai/glm-5.2")
-        # None means no cap: reasoning models need room to finish thinking before
-        # they emit any visible text, so by default we do not limit output tokens.
+        # Omitting max_tokens does NOT mean unlimited: the provider then applies its
+        # own small default and truncates long reasoning mid-sentence (e.g. the
+        # spreadsheet task got cut before finishing the last column). So we set a
+        # generous explicit ceiling by default; pass "none"/"unlimited" in the env
+        # to opt out and rely on the provider default instead.
         self.action_max_tokens = self._resolve_max_tokens(
-            action_max_tokens, "OPENROUTER_ACTION_MAX_TOKENS")
+            action_max_tokens, "OPENROUTER_ACTION_MAX_TOKENS", default=2048)
         self.answer_max_tokens = self._resolve_max_tokens(
-            answer_max_tokens, "OPENROUTER_ANSWER_MAX_TOKENS")
+            answer_max_tokens, "OPENROUTER_ANSWER_MAX_TOKENS", default=6000)
         self.max_steps = max_steps or int(os.getenv("AGENT_MAX_STEPS", "8"))
         # Reasoning models (e.g. z-ai/glm-5.2) can loop forever in their hidden
         # reasoning channel on hard tasks and never emit visible content, burning
@@ -148,16 +154,18 @@ class GaiaAgent:
         self.graph = self._build_graph()
 
     @staticmethod
-    def _resolve_max_tokens(value: int | None, env_name: str) -> int | None:
+    def _resolve_max_tokens(value: int | None, env_name: str, default: int | None) -> int | None:
         if value is not None:
             return value
         raw = os.getenv(env_name, "").strip().lower()
-        if raw in {"", "0", "none", "unlimited", "-1"}:
+        if raw == "":
+            return default
+        if raw in {"0", "none", "unlimited", "-1"}:
             return None
         try:
             return int(raw)
         except ValueError:
-            return None
+            return default
 
     def __call__(self, question: str) -> str:
         result = self.run(question)
@@ -250,7 +258,8 @@ class GaiaAgent:
         response = self._chat(
             [
                 {"role": "system", "content": ACTION_PROMPT},
-                {"role": "user", "content": self._format_action_context(state)},
+                {"role": "user",
+                    "content": self._format_action_context(state)},
             ],
             max_tokens=self.action_max_tokens,
             step_name="Action decision step",
@@ -260,6 +269,9 @@ class GaiaAgent:
 
         message = response.choices[0].message
         action, action_input = self._parse_model_message(message)
+        if action == "web_search" and self._should_answer_from_attachment(state):
+            action = "final_answer"
+            action_input = {}
         if action in {
             "run_python_attachment",
             "analyze_document_attachment",
@@ -296,9 +308,15 @@ class GaiaAgent:
         )
         return {
             "reasoning": reasoning,
-            "answer": answer,
+            "answer": self._finalize_answer(answer),
             "steps": [*state["steps"], "reason:final_answer"],
         }
+
+    @staticmethod
+    def _finalize_answer(text: str) -> str:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        answer = lines[-1] if lines else text.strip()
+        return answer.strip("*`_ ").strip()
 
     def _split_observations(
         self,
@@ -313,6 +331,40 @@ class GaiaAgent:
             else:
                 successful.append(observation)
         return successful, errors
+
+    def _should_answer_from_attachment(self, state: GaiaState) -> bool:
+        if self._question_requires_external_information(state["question"]):
+            return False
+
+        successful, _errors = self._split_observations(state)
+        return any(
+            observation.get("action") in {
+                "analyze_document_attachment",
+                "analyze_image_attachment",
+                "run_python_attachment",
+            }
+            for observation in successful
+        )
+
+    @staticmethod
+    def _question_requires_external_information(question: str) -> bool:
+        external_markers = [
+            "web",
+            "website",
+            "internet",
+            "online",
+            "search",
+            "current",
+            "latest",
+            "today",
+            "news",
+            "url",
+            "link",
+            "page",
+            "site",
+        ]
+        question_lower = question.lower()
+        return any(marker in question_lower for marker in external_markers)
 
     def _format_reasoning_context(self, state: GaiaState) -> str:
         successful, errors = self._split_observations(state)
