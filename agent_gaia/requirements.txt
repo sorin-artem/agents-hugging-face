@@ -1,6 +1,7 @@
 ddgs
 datasets
 gradio
+httpx
 huggingface_hub
 langgraph
 langchain-core

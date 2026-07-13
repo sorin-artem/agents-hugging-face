@@ -1,12 +1,13 @@
+import asyncio
 import os
 import json
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langsmith import traceable
-from openai import OpenAI
+from openai import AsyncOpenAI
 
-from tools import AGENT_TOOLS
+from tools import AGENT_TOOLS, ASYNC_AGENT_TOOLS
 
 
 ACTION_PROMPT = """
@@ -127,7 +128,7 @@ class GaiaAgent:
         if not api_key:
             raise ValueError("Set OPEN_ROUTER_API_KEY.")
 
-        self.client = OpenAI(
+        self.client = AsyncOpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
         )
@@ -139,9 +140,9 @@ class GaiaAgent:
         # generous explicit ceiling by default; pass "none"/"unlimited" in the env
         # to opt out and rely on the provider default instead.
         self.action_max_tokens = self._resolve_max_tokens(
-            action_max_tokens, "OPENROUTER_ACTION_MAX_TOKENS", default=2048)
+            action_max_tokens, "OPENROUTER_ACTION_MAX_TOKENS", default=3072)
         self.answer_max_tokens = self._resolve_max_tokens(
-            answer_max_tokens, "OPENROUTER_ANSWER_MAX_TOKENS", default=6000)
+            answer_max_tokens, "OPENROUTER_ANSWER_MAX_TOKENS", default=12000)
         self.max_steps = max_steps or int(os.getenv("AGENT_MAX_STEPS", "8"))
         # Reasoning models (e.g. z-ai/glm-5.2) can loop forever in their hidden
         # reasoning channel on hard tasks and never emit visible content, burning
@@ -173,7 +174,18 @@ class GaiaAgent:
 
     @traceable(name="gaia_agent_run")
     def run(self, question: str) -> GaiaState:
-        initial_state: GaiaState = {
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.arun(question))
+        raise RuntimeError("GaiaAgent.run() cannot be called from an active event loop. Use arun().")
+
+    @traceable(name="gaia_agent_arun")
+    async def arun(self, question: str) -> GaiaState:
+        return await self.graph.ainvoke(self._initial_state(question))
+
+    def _initial_state(self, question: str) -> GaiaState:
+        return {
             "question": question,
             "action": "",
             "action_input": {},
@@ -188,7 +200,6 @@ class GaiaAgent:
             "steps": [],
             "step_count": 0,
         }
-        return self.graph.invoke(initial_state)
 
     def _build_graph(self):
         workflow = StateGraph(GaiaState)
@@ -218,7 +229,7 @@ class GaiaAgent:
 
         return workflow.compile()
 
-    def _chat(self, messages: list[dict[str, object]], *, max_tokens: int | None, step_name: str, **kwargs):
+    async def _chat(self, messages: list[dict[str, object]], *, max_tokens: int | None, step_name: str, **kwargs):
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         if not self.reasoning_enabled:
@@ -226,7 +237,7 @@ class GaiaAgent:
             extra_body.setdefault("reasoning", {"enabled": False})
             kwargs["extra_body"] = extra_body
         try:
-            return self.client.chat.completions.create(
+            return await self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 temperature=0,
@@ -237,8 +248,8 @@ class GaiaAgent:
                 f"{step_name} failed: model request error: {type(error).__name__}: {error}"
             ) from error
 
-    def _complete_text(self, system_prompt: str, user_prompt: str, *, max_tokens: int, step_name: str) -> str:
-        response = self._chat(
+    async def _complete_text(self, system_prompt: str, user_prompt: str, *, max_tokens: int, step_name: str) -> str:
+        response = await self._chat(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -254,8 +265,8 @@ class GaiaAgent:
         return content
 
     @traceable(name="decide_action")
-    def _decide_action(self, state: GaiaState) -> dict[str, object]:
-        response = self._chat(
+    async def _decide_action(self, state: GaiaState) -> dict[str, object]:
+        response = await self._chat(
             [
                 {"role": "system", "content": ACTION_PROMPT},
                 {"role": "user",
@@ -269,14 +280,18 @@ class GaiaAgent:
 
         message = response.choices[0].message
         action, action_input = self._parse_model_message(message)
-        if action == "web_search" and self._should_answer_from_attachment(state):
-            action = "final_answer"
-            action_input = {}
-        if action in {
+        attachment_actions = {
             "run_python_attachment",
             "analyze_document_attachment",
             "analyze_image_attachment",
-        }:
+        }
+        if action == "web_search" and self._should_answer_from_attachment(state):
+            action = "final_answer"
+            action_input = {}
+        if action in attachment_actions and self._should_answer_from_attachment(state):
+            action = "final_answer"
+            action_input = {}
+        if action in attachment_actions:
             action_input = self._with_attachment_args(
                 action,
                 action_input,
@@ -293,19 +308,26 @@ class GaiaAgent:
         }
 
     @traceable(name="reason")
-    def _reason(self, state: GaiaState) -> dict[str, object]:
-        reasoning = self._complete_text(
-            REASONING_PROMPT,
-            self._format_reasoning_context(state),
-            max_tokens=self.answer_max_tokens,
-            step_name="Reasoning step",
-        )
-        answer = self._complete_text(
-            FINAL_ANSWER_PROMPT,
-            self._format_extract_context(state, reasoning),
-            max_tokens=self.answer_max_tokens,
-            step_name="Final answer step",
-        )
+    async def _reason(self, state: GaiaState) -> dict[str, object]:
+        try:
+            reasoning = await self._complete_text(
+                REASONING_PROMPT,
+                self._format_reasoning_context(state),
+                max_tokens=self.answer_max_tokens,
+                step_name="Reasoning step",
+            )
+        except AgentError as error:
+            reasoning = self._fallback_reasoning(state, error)
+
+        try:
+            answer = await self._complete_text(
+                FINAL_ANSWER_PROMPT,
+                self._format_extract_context(state, reasoning),
+                max_tokens=self.answer_max_tokens,
+                step_name="Final answer step",
+            )
+        except AgentError:
+            answer = self._best_effort_non_empty_answer(state)
         return {
             "reasoning": reasoning,
             "answer": self._finalize_answer(answer),
@@ -317,6 +339,36 @@ class GaiaAgent:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         answer = lines[-1] if lines else text.strip()
         return answer.strip("*`_ ").strip()
+
+    def _fallback_reasoning(self, state: GaiaState, error: AgentError) -> str:
+        successful, errors = self._split_observations(state)
+        sections = [
+            f"Reasoning model did not return text: {error}",
+            "Use the available observations to answer if possible.",
+            "Successful tool observations:",
+            json.dumps(successful, ensure_ascii=False, indent=2),
+        ]
+        if errors:
+            sections.extend([
+                "Tool errors:",
+                json.dumps(errors, ensure_ascii=False, indent=2),
+            ])
+        draft = state.get("draft_answer", "").strip()
+        if draft:
+            sections.extend(["Draft answer:", draft])
+        return "\n\n".join(sections)
+
+    def _best_effort_non_empty_answer(self, state: GaiaState) -> str:
+        draft = state.get("draft_answer", "").strip()
+        if draft:
+            return draft
+
+        successful, _errors = self._split_observations(state)
+        for observation in reversed(successful):
+            text = observation.get("observation", "").strip()
+            if text:
+                return text[:500]
+        return "Unable to determine"
 
     def _split_observations(
         self,
@@ -519,14 +571,14 @@ class GaiaAgent:
                     return body
         return question.strip()
 
-    def _invoke_tool(self, action: str, tool_input: dict[str, str]) -> str:
+    async def _invoke_tool(self, action: str, tool_input: dict[str, str]) -> str:
         try:
-            return AGENT_TOOLS[action].invoke(tool_input)
+            return await ASYNC_AGENT_TOOLS[action](**tool_input)
         except Exception as error:
             return f"{action} failed: {type(error).__name__}: {error}"
 
     @traceable(name="execute_tool")
-    def _execute_tool(self, state: GaiaState) -> dict[str, object]:
+    async def _execute_tool(self, state: GaiaState) -> dict[str, object]:
         action = state["action"]
         action_input = state["action_input"]
         observation = ""
@@ -537,12 +589,12 @@ class GaiaAgent:
 
         if action == "web_search":
             query = action_input.get("query", "").strip() or state["question"]
-            observation = self._invoke_tool(action, {"query": query})
+            observation = await self._invoke_tool(action, {"query": query})
             update["search_query"] = query
             update["search_results"] = observation
         elif action == "search_url":
             url = action_input.get("url", "").strip()
-            observation = self._invoke_tool(action, {"url": url})
+            observation = await self._invoke_tool(action, {"url": url})
             update["page_url"] = url
             update["page_content"] = observation
         elif action in AGENT_TOOLS:
@@ -556,7 +608,7 @@ class GaiaAgent:
                     action_input,
                     state["question"],
                 )
-            observation = self._invoke_tool(action, action_input)
+            observation = await self._invoke_tool(action, action_input)
         else:
             observation = f"Unknown action: {action}"
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from io import BytesIO
 import os
@@ -9,7 +10,7 @@ import tempfile
 
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 import requests
 from trafilatura import extract, fetch_url
 
@@ -136,6 +137,94 @@ def run_python_attachment_file(
     )
 
 
+async def web_search_text_async(query: str) -> str:
+    return await asyncio.to_thread(web_search_text, query)
+
+
+async def read_url_text_async(url: str) -> str:
+    return await asyncio.to_thread(read_url_text, url)
+
+
+async def run_python_attachment_file_async(
+    task_id: str,
+    file_name: str = "",
+    timeout_seconds: int = 5,
+) -> str:
+    task_id = task_id.strip()
+    file_name = file_name.strip()
+    if not task_id:
+        return "No task_id provided."
+    if file_name and Path(file_name).suffix.lower() != ".py":
+        return (
+            f"run_python_attachment only supports .py files. "
+            f"Received {file_name!r}; use analyze_document_attachment for this file."
+        )
+
+    try:
+        python_bytes, _content_type, source = await asyncio.to_thread(
+            _download_or_read_task_file,
+            task_id,
+            file_name,
+        )
+    except RuntimeError as error:
+        return str(error)
+
+    if not python_bytes:
+        return f"Loaded Python file for task_id {task_id}, but it was empty."
+
+    source_code = _decode_text(python_bytes)
+    timeout = max(1, min(int(timeout_seconds), 20))
+
+    with tempfile.TemporaryDirectory(prefix="attached_python_") as temp_dir:
+        script_name = Path(file_name).name or f"{task_id}.py"
+        script_path = Path(temp_dir) / script_name
+        script_path.write_text(source_code, encoding="utf-8")
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *_docker_python_command(temp_dir, script_name),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            return (
+                f"Python source: {source}\n"
+                "Execution failed: Docker CLI was not found. Install/start Docker or set up "
+                "another sandbox backend.\n"
+                f"Source preview:\n{source_code[:MAX_SOURCE_CHARS]}"
+            )
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout + 2,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            stdout_bytes, stderr_bytes = await process.communicate()
+            stdout = stdout_bytes.decode("utf-8", errors="replace")[:MAX_TOOL_OUTPUT_CHARS]
+            stderr = stderr_bytes.decode("utf-8", errors="replace")[:MAX_TOOL_OUTPUT_CHARS]
+            return (
+                f"Python source: {source}\n"
+                f"Docker image: {PYTHON_DOCKER_IMAGE}\n"
+                f"Execution timed out after {timeout} seconds.\n"
+                f"Stdout:\n{stdout}\n"
+                f"Stderr:\n{stderr}\n"
+                f"Source preview:\n{source_code[:MAX_SOURCE_CHARS]}"
+            )
+
+    stdout = stdout_bytes.decode("utf-8", errors="replace")[:MAX_TOOL_OUTPUT_CHARS]
+    stderr = stderr_bytes.decode("utf-8", errors="replace")[:MAX_TOOL_OUTPUT_CHARS]
+    return (
+        f"Python source: {source}\n"
+        f"Docker image: {PYTHON_DOCKER_IMAGE}\n"
+        f"Exit code: {process.returncode}\n"
+        f"Stdout:\n{stdout}\n"
+        f"Stderr:\n{stderr}\n"
+        f"Source preview:\n{source_code[:MAX_SOURCE_CHARS]}"
+    )
+
+
 def analyze_document_attachment_file(
     task_id: str,
     question: str = "",
@@ -176,6 +265,19 @@ def analyze_document_attachment_file(
     )
 
 
+async def analyze_document_attachment_file_async(
+    task_id: str,
+    question: str = "",
+    file_name: str = "",
+) -> str:
+    return await asyncio.to_thread(
+        analyze_document_attachment_file,
+        task_id,
+        question,
+        file_name,
+    )
+
+
 def analyze_image_attachment_file(task_id: str, question: str, file_name: str = "") -> str:
     task_id = task_id.strip()
     question = question.strip()
@@ -208,6 +310,54 @@ def analyze_image_attachment_file(task_id: str, question: str, file_name: str = 
 
     try:
         completion = client.chat.completions.create(
+            model=_vision_model(),
+            messages=_image_analysis_messages(question, data_url),
+            temperature=0,
+            max_tokens=1024,
+        )
+    except Exception as error:
+        return f"Image analysis failed: {type(error).__name__}: {error}"
+
+    analysis = completion.choices[0].message.content or ""
+    return f"Image source: {source}\n{analysis.strip()}"
+
+
+async def analyze_image_attachment_file_async(task_id: str, question: str, file_name: str = "") -> str:
+    task_id = task_id.strip()
+    question = question.strip()
+    file_name = file_name.strip()
+    if not task_id:
+        return "No task_id provided."
+    if not question:
+        return "No image question provided."
+
+    api_key = os.getenv("OPEN_ROUTER_API_KEY")
+    if not api_key:
+        return "Set OPEN_ROUTER_API_KEY to use image analysis."
+
+    try:
+        image_bytes, content_type, source = await asyncio.to_thread(
+            _download_or_read_task_file,
+            task_id,
+            file_name,
+        )
+    except RuntimeError as error:
+        return str(error)
+
+    if not image_bytes:
+        return f"Loaded file for task_id {task_id}, but it was empty."
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        return f"Image is too large to analyze ({len(image_bytes)} bytes)."
+
+    mime_type = _guess_image_mime(image_bytes, content_type)
+    data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    try:
+        completion = await client.chat.completions.create(
             model=_vision_model(),
             messages=_image_analysis_messages(question, data_url),
             temperature=0,

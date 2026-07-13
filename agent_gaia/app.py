@@ -1,9 +1,10 @@
 import os
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
+import time
 
 import gradio as gr
-import requests
+import httpx
 from dotenv import load_dotenv
 from langsmith import traceable
 
@@ -44,10 +45,13 @@ DEFAULT_FILE_TASK_IDS = [
     # "1f975693-876d-457b-a649-393859e79bf3",  # homework audio
 ]
 CHECK_QUESTION_LIMIT = int(
-    os.getenv("CHECK_QUESTION_LIMIT", str(len(DEFAULT_FILE_TASK_IDS))))
+    os.getenv("CHECK_QUESTION_LIMIT", "20"))
 CHECK_MAX_WORKERS = int(
-    os.getenv("CHECK_MAX_WORKERS", str(CHECK_QUESTION_LIMIT)))
+    os.getenv("CHECK_MAX_WORKERS", "3"))
 CHECK_MODEL = os.getenv("CHECK_OPENROUTER_MODEL", "z-ai/glm-5.2")
+CHECK_QUESTION_MODE = os.getenv("CHECK_QUESTION_MODE", "all").strip().lower()
+CHECK_QUESTION_TIMEOUT_SECONDS = int(
+    os.getenv("CHECK_QUESTION_TIMEOUT_SECONDS", "180"))
 
 
 def optional_int_env(name: str) -> int | None:
@@ -68,10 +72,11 @@ CHECK_ANSWER_MAX_TOKENS = optional_int_env("CHECK_OPENROUTER_ANSWER_MAX_TOKENS")
 CHECK_MAX_STEPS = int(os.getenv("CHECK_AGENT_MAX_STEPS", "6"))
 
 
-def get_questions() -> list[dict[str, str]]:
-    response = requests.get(f"{API_URL}/questions", timeout=30)
-    response.raise_for_status()
-    return response.json()
+async def get_questions() -> list[dict[str, str]]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(f"{API_URL}/questions")
+        response.raise_for_status()
+        return response.json()
 
 
 def file_extension(file_name: str) -> str:
@@ -97,21 +102,30 @@ def sort_file_questions(questions: list[dict[str, str]]) -> list[dict[str, str]]
     )
 
 
-def get_supported_file_questions() -> list[dict[str, str]]:
+async def get_supported_file_questions() -> list[dict[str, str]]:
     questions = [
         item
-        for item in get_questions()
+        for item in await get_questions()
         if item.get("task_id") and item.get("question") and is_supported_file_question(item)
     ]
     return sort_file_questions(questions)
 
 
-def get_check_questions() -> list[dict[str, str]]:
-    questions = [
+async def get_valid_questions() -> list[dict[str, str]]:
+    return [
         item
-        for item in get_questions()
+        for item in await get_questions()
         if item.get("task_id") and item.get("question")
     ]
+
+
+def is_audio_file_question(item: dict[str, str]) -> bool:
+    file_name = str(item.get("file_name", ""))
+    return bool(file_name) and file_extension(file_name) in UNSUPPORTED_FILE_EXTENSIONS
+
+
+async def get_check_questions() -> list[dict[str, str]]:
+    questions = await get_valid_questions()
     questions_by_id = {str(item["task_id"]): item for item in questions}
     check_task_ids = os.getenv("CHECK_TASK_IDS", "").strip()
     if check_task_ids:
@@ -127,14 +141,14 @@ def get_check_questions() -> list[dict[str, str]]:
         ]
         return preferred_questions[:CHECK_QUESTION_LIMIT]
 
-    return get_supported_file_questions()[:CHECK_QUESTION_LIMIT]
+    return questions[:CHECK_QUESTION_LIMIT]
 
 
-def summarize_file_questions() -> str:
-    supported = get_supported_file_questions()
+async def summarize_file_questions() -> str:
+    supported = await get_supported_file_questions()
     all_file_questions = [
         item
-        for item in get_questions()
+        for item in await get_questions()
         if item.get("task_id") and item.get("question") and item.get("file_name")
     ]
     unsupported = [
@@ -160,8 +174,27 @@ def summarize_file_questions() -> str:
     return "\n".join(lines)
 
 
-def preview_file_tasks() -> tuple[str, str]:
-    return "File task preview loaded.", summarize_file_questions()
+async def summarize_check_questions() -> str:
+    selected = await get_check_questions()
+    lines = [
+        f"Question mode: {CHECK_QUESTION_MODE}",
+        f"Selected questions: {len(selected)}",
+        f"Question limit: {CHECK_QUESTION_LIMIT}",
+        f"Parallel workers: {CHECK_MAX_WORKERS}",
+        "",
+    ]
+    for index, item in enumerate(selected, start=1):
+        question = str(item.get("question", "")).replace("\n", " ")
+        file_name = str(item.get("file_name", ""))
+        suffix = f" | {file_name}" if file_name else ""
+        lines.append(
+            f"{index}. {item.get('task_id')}{suffix} | {question[:140]}"
+        )
+    return "\n".join(lines)
+
+
+async def preview_file_tasks() -> tuple[str, str]:
+    return "Question preview loaded.", await summarize_check_questions()
 
 
 def question_label(item: dict[str, str], index: int) -> str:
@@ -200,7 +233,7 @@ def create_check_agent() -> GaiaAgent:
 
 
 @traceable(name="run_single_question")
-def run_single_question(
+async def run_single_question(
     label: str,
     task_id: str,
     question: str,
@@ -208,7 +241,7 @@ def run_single_question(
     agent: GaiaAgent | None = None,
 ) -> dict[str, object]:
     agent_question = build_agent_question(task_id, question, file_name)
-    result = (agent or create_check_agent()).run(agent_question)
+    result = await (agent or create_check_agent()).arun(agent_question)
     return {
         "label": label,
         "task_id": task_id,
@@ -248,38 +281,61 @@ def failed_question_run(
     }
 
 
-def run_check_question(index: int, item: dict[str, str]) -> dict[str, object]:
+async def run_check_question(index: int, item: dict[str, str]) -> dict[str, object]:
+    started_at = time.monotonic()
     label = question_label(item, index)
     task_id = str(item["task_id"])
     question = str(item["question"])
     file_name = str(item.get("file_name", ""))
     try:
-        return run_single_question(label, task_id, question, file_name)
+        run = await run_single_question(label, task_id, question, file_name)
+        run["status"] = "completed"
+        run["duration_seconds"] = round(time.monotonic() - started_at, 2)
+        return run
     except Exception as error:
-        return failed_question_run(label, task_id, question, error, file_name)
+        run = failed_question_run(label, task_id, question, error, file_name)
+        run["status"] = "failed"
+        run["duration_seconds"] = round(time.monotonic() - started_at, 2)
+        return run
 
 
-@traceable(name="run_file_questions_parallel")
-def run_file_questions_parallel() -> dict[str, object]:
+@traceable(name="run_selected_questions_parallel")
+async def run_selected_questions_parallel() -> dict[str, object]:
     username = os.getenv("HF_USERNAME", "sorin-artem").strip()
     agent_code = build_agent_code_url(os.getenv("AGENT_CODE_URL", ""))
-    questions = get_check_questions()
+    questions = await get_check_questions()
     indexed_questions = list(enumerate(questions, start=1))
-    runs_by_index: dict[int, dict[str, object]] = {}
+    semaphore = asyncio.Semaphore(CHECK_MAX_WORKERS)
 
-    with ThreadPoolExecutor(max_workers=CHECK_MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(run_check_question, index, item): index
+    async def run_with_limit(index: int, item: dict[str, str]) -> dict[str, object]:
+        async with semaphore:
+            try:
+                return await asyncio.wait_for(
+                    run_check_question(index, item),
+                    timeout=CHECK_QUESTION_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as error:
+                task_id = str(item["task_id"])
+                question = str(item["question"])
+                file_name = str(item.get("file_name", ""))
+                run = failed_question_run(
+                    question_label(item, index),
+                    task_id,
+                    question,
+                    error,
+                    file_name,
+                )
+                run["status"] = "timeout"
+                run["duration_seconds"] = CHECK_QUESTION_TIMEOUT_SECONDS
+                return run
+
+    runs = await asyncio.gather(
+        *[
+            run_with_limit(index, item)
             for index, item in indexed_questions
-        }
-        for future in as_completed(futures):
-            runs_by_index[futures[future]] = future.result()
+        ]
+    )
 
-    runs = [
-        runs_by_index[index]
-        for index, _item in indexed_questions
-        if index in runs_by_index
-    ]
     answers_payload = [
         {
             "task_id": str(run["task_id"]),
@@ -293,9 +349,18 @@ def run_file_questions_parallel() -> dict[str, object]:
         "answers": answers_payload,
     }
 
-    response = requests.post(f"{API_URL}/submit", json=payload, timeout=60)
-    response.raise_for_status()
-    submission_result = response.json()
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(f"{API_URL}/submit", json=payload)
+            response.raise_for_status()
+            submission_result = response.json()
+    except Exception as error:
+        submission_result = {
+            "score": "N/A",
+            "correct_count": "?",
+            "total_attempted": len(answers_payload),
+            "message": f"Submission failed: {type(error).__name__}: {error}",
+        }
     return {
         "submission_result": submission_result,
         "answers": answers_payload,
@@ -304,6 +369,7 @@ def run_file_questions_parallel() -> dict[str, object]:
             "model": CHECK_MODEL,
             "question_limit": CHECK_QUESTION_LIMIT,
             "max_workers": CHECK_MAX_WORKERS,
+            "question_timeout_seconds": CHECK_QUESTION_TIMEOUT_SECONDS,
             "action_max_tokens": CHECK_ACTION_MAX_TOKENS,
             "answer_max_tokens": CHECK_ANSWER_MAX_TOKENS,
             "max_steps": CHECK_MAX_STEPS,
@@ -311,8 +377,8 @@ def run_file_questions_parallel() -> dict[str, object]:
     }
 
 
-def run_and_check_file_questions() -> tuple[str, str]:
-    result = run_file_questions_parallel()
+async def run_and_check_selected_questions() -> tuple[str, str]:
+    result = await run_selected_questions_parallel()
     submission_result = result["submission_result"]
     status = (
         f"Score: {submission_result.get('score', 'N/A')}% "
@@ -326,11 +392,12 @@ def run_and_check_file_questions() -> tuple[str, str]:
 with gr.Blocks() as demo:
     gr.Markdown("# General Tool Agent")
     gr.Markdown(
-        "Runs supported file-attachment tasks in parallel, then submits the answers "
-        "to the Hugging Face scoring API. Audio tasks are skipped for now."
+        "Runs selected questions in parallel, then submits the answers to the "
+        "Hugging Face scoring API. Configure CHECK_QUESTION_MODE=all, no_audio, "
+        "or file_supported."
     )
-    preview_button = gr.Button("Preview supported file tasks")
-    submit_button = gr.Button("Run supported file tasks and check")
+    preview_button = gr.Button("Preview selected questions")
+    submit_button = gr.Button("Run selected questions and check")
     submit_status_output = gr.Textbox(label="Check result", lines=3)
     submit_log_output = gr.Code(label="Run log", language="json", lines=20)
     preview_button.click(
@@ -339,7 +406,7 @@ with gr.Blocks() as demo:
         outputs=[submit_status_output, submit_log_output],
     )
     submit_button.click(
-        fn=run_and_check_file_questions,
+        fn=run_and_check_selected_questions,
         inputs=None,
         outputs=[submit_status_output, submit_log_output],
     )

@@ -3,18 +3,28 @@ from langchain_core.tools import tool
 if __package__:
     from .tool_helpers import (
         analyze_document_attachment_file,
+        analyze_document_attachment_file_async,
         analyze_image_attachment_file,
+        analyze_image_attachment_file_async,
         read_url_text,
+        read_url_text_async,
         run_python_attachment_file,
+        run_python_attachment_file_async,
         web_search_text,
+        web_search_text_async,
     )
 else:
     from tool_helpers import (
         analyze_document_attachment_file,
+        analyze_document_attachment_file_async,
         analyze_image_attachment_file,
+        analyze_image_attachment_file_async,
         read_url_text,
+        read_url_text_async,
         run_python_attachment_file,
+        run_python_attachment_file_async,
         web_search_text,
+        web_search_text_async,
     )
 
 
@@ -54,4 +64,12 @@ AGENT_TOOLS = {
     run_python_attachment.name: run_python_attachment,
     analyze_document_attachment.name: analyze_document_attachment,
     analyze_image_attachment.name: analyze_image_attachment,
+}
+
+ASYNC_AGENT_TOOLS = {
+    web_search.name: web_search_text_async,
+    search_url.name: read_url_text_async,
+    run_python_attachment.name: run_python_attachment_file_async,
+    analyze_document_attachment.name: analyze_document_attachment_file_async,
+    analyze_image_attachment.name: analyze_image_attachment_file_async,
 }
