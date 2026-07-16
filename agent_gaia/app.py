@@ -46,12 +46,10 @@ DEFAULT_FILE_TASK_IDS = [
 ]
 CHECK_QUESTION_LIMIT = int(
     os.getenv("CHECK_QUESTION_LIMIT", "20"))
-CHECK_MAX_WORKERS = int(
-    os.getenv("CHECK_MAX_WORKERS", "3"))
 CHECK_MODEL = os.getenv("CHECK_OPENROUTER_MODEL", "z-ai/glm-5.2")
 CHECK_QUESTION_MODE = os.getenv("CHECK_QUESTION_MODE", "all").strip().lower()
 CHECK_QUESTION_TIMEOUT_SECONDS = int(
-    os.getenv("CHECK_QUESTION_TIMEOUT_SECONDS", "180"))
+    os.getenv("CHECK_QUESTION_TIMEOUT_SECONDS", "300"))
 
 
 def optional_int_env(name: str) -> int | None:
@@ -180,7 +178,7 @@ async def summarize_check_questions() -> str:
         f"Question mode: {CHECK_QUESTION_MODE}",
         f"Selected questions: {len(selected)}",
         f"Question limit: {CHECK_QUESTION_LIMIT}",
-        f"Parallel workers: {CHECK_MAX_WORKERS}",
+        "Parallel workers: unlimited async tasks",
         "",
     ]
     for index, item in enumerate(selected, start=1):
@@ -305,29 +303,27 @@ async def run_selected_questions_parallel() -> dict[str, object]:
     agent_code = build_agent_code_url(os.getenv("AGENT_CODE_URL", ""))
     questions = await get_check_questions()
     indexed_questions = list(enumerate(questions, start=1))
-    semaphore = asyncio.Semaphore(CHECK_MAX_WORKERS)
 
     async def run_with_limit(index: int, item: dict[str, str]) -> dict[str, object]:
-        async with semaphore:
-            try:
-                return await asyncio.wait_for(
-                    run_check_question(index, item),
-                    timeout=CHECK_QUESTION_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError as error:
-                task_id = str(item["task_id"])
-                question = str(item["question"])
-                file_name = str(item.get("file_name", ""))
-                run = failed_question_run(
-                    question_label(item, index),
-                    task_id,
-                    question,
-                    error,
-                    file_name,
-                )
-                run["status"] = "timeout"
-                run["duration_seconds"] = CHECK_QUESTION_TIMEOUT_SECONDS
-                return run
+        try:
+            return await asyncio.wait_for(
+                run_check_question(index, item),
+                timeout=CHECK_QUESTION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as error:
+            task_id = str(item["task_id"])
+            question = str(item["question"])
+            file_name = str(item.get("file_name", ""))
+            run = failed_question_run(
+                question_label(item, index),
+                task_id,
+                question,
+                error,
+                file_name,
+            )
+            run["status"] = "timeout"
+            run["duration_seconds"] = CHECK_QUESTION_TIMEOUT_SECONDS
+            return run
 
     runs = await asyncio.gather(
         *[
@@ -368,7 +364,7 @@ async def run_selected_questions_parallel() -> dict[str, object]:
         "settings": {
             "model": CHECK_MODEL,
             "question_limit": CHECK_QUESTION_LIMIT,
-            "max_workers": CHECK_MAX_WORKERS,
+            "concurrency": "unlimited_async_tasks",
             "question_timeout_seconds": CHECK_QUESTION_TIMEOUT_SECONDS,
             "action_max_tokens": CHECK_ACTION_MAX_TOKENS,
             "answer_max_tokens": CHECK_ANSWER_MAX_TOKENS,
