@@ -8,7 +8,9 @@ langchain-core
 langsmith
 openai
 openpyxl
+pandas
 pypdf
 python-dotenv
 requests
+spaces
 trafilatura

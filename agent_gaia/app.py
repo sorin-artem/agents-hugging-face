@@ -1,55 +1,30 @@
 import os
-import json
 import asyncio
 import time
 
 import gradio as gr
-import httpx
+import pandas as pd
+import requests
+import spaces
 from dotenv import load_dotenv
-from langsmith import traceable
 
 from agent_langgraph import GaiaAgent
 
 
 load_dotenv()
 
-API_URL = "https://agents-course-unit4-scoring.hf.space"
-SUPPORTED_FILE_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".webp",
-    ".gif",
-    ".py",
-    ".pdf",
-    ".xlsx",
-    ".xlsm",
-    ".csv",
-    ".tsv",
-    ".txt",
-    ".md",
-    ".json",
-    ".xml",
-}
-UNSUPPORTED_FILE_EXTENSIONS = {
-    ".mp3",
-    ".wav",
-    ".m4a",
-    ".flac",
-}
-DEFAULT_FILE_TASK_IDS = [
-    "cca530fc-4052-43b2-b130-b30968d8aa44",  # chess position image
-    "f918266a-b3e0-4914-865d-4faa564f1aef",  # Python code file
-    "7bd855d8-463d-4ed5-93ca-5fe35145f733",  # Excel spreadsheet
-    # "99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3",  # recipe audio
-    # "1f975693-876d-457b-a649-393859e79bf3",  # homework audio
-]
-CHECK_QUESTION_LIMIT = int(
-    os.getenv("CHECK_QUESTION_LIMIT", "20"))
-CHECK_MODEL = os.getenv("CHECK_OPENROUTER_MODEL", "z-ai/glm-5.2")
-CHECK_QUESTION_MODE = os.getenv("CHECK_QUESTION_MODE", "all").strip().lower()
-CHECK_QUESTION_TIMEOUT_SECONDS = int(
-    os.getenv("CHECK_QUESTION_TIMEOUT_SECONDS", "300"))
+# ZeroGPU Spaces require at least one @spaces.GPU function at startup.
+# The agent itself uses OpenRouter (no local GPU), so this is only a platform hook.
+@spaces.GPU(duration=60)
+def _zero_gpu_placeholder() -> str:
+    return "ok"
+
+
+# --- Constants ---
+DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
+QUESTION_TIMEOUT_SECONDS = int(os.getenv("CHECK_QUESTION_TIMEOUT_SECONDS", "300"))
+CHECK_MODEL = os.getenv("CHECK_OPENROUTER_MODEL", os.getenv("OPENROUTER_MODEL", "z-ai/glm-5.2"))
+CHECK_MAX_STEPS = int(os.getenv("CHECK_AGENT_MAX_STEPS", os.getenv("AGENT_MAX_STEPS", "8")))
 
 
 def optional_int_env(name: str) -> int | None:
@@ -62,142 +37,8 @@ def optional_int_env(name: str) -> int | None:
         return None
 
 
-# None here means "unset" — the agent then falls back to its own generous default
-# ceiling. It does NOT mean unlimited output (the provider truncates long reasoning
-# when no cap is sent). Set the env to a number to override, or "none" to opt out.
 CHECK_ACTION_MAX_TOKENS = optional_int_env("CHECK_OPENROUTER_ACTION_MAX_TOKENS")
 CHECK_ANSWER_MAX_TOKENS = optional_int_env("CHECK_OPENROUTER_ANSWER_MAX_TOKENS")
-CHECK_MAX_STEPS = int(os.getenv("CHECK_AGENT_MAX_STEPS", "6"))
-
-
-async def get_questions() -> list[dict[str, str]]:
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(f"{API_URL}/questions")
-        response.raise_for_status()
-        return response.json()
-
-
-def file_extension(file_name: str) -> str:
-    return os.path.splitext(file_name.strip())[1].lower()
-
-
-def is_supported_file_question(item: dict[str, str]) -> bool:
-    file_name = str(item.get("file_name", ""))
-    return bool(file_name) and file_extension(file_name) in SUPPORTED_FILE_EXTENSIONS
-
-
-def sort_file_questions(questions: list[dict[str, str]]) -> list[dict[str, str]]:
-    preferred_order = {
-        task_id: index
-        for index, task_id in enumerate(DEFAULT_FILE_TASK_IDS)
-    }
-    return sorted(
-        questions,
-        key=lambda item: (
-            preferred_order.get(str(item.get("task_id", "")), len(preferred_order)),
-            str(item.get("file_name", "")),
-        ),
-    )
-
-
-async def get_supported_file_questions() -> list[dict[str, str]]:
-    questions = [
-        item
-        for item in await get_questions()
-        if item.get("task_id") and item.get("question") and is_supported_file_question(item)
-    ]
-    return sort_file_questions(questions)
-
-
-async def get_valid_questions() -> list[dict[str, str]]:
-    return [
-        item
-        for item in await get_questions()
-        if item.get("task_id") and item.get("question")
-    ]
-
-
-def is_audio_file_question(item: dict[str, str]) -> bool:
-    file_name = str(item.get("file_name", ""))
-    return bool(file_name) and file_extension(file_name) in UNSUPPORTED_FILE_EXTENSIONS
-
-
-async def get_check_questions() -> list[dict[str, str]]:
-    questions = await get_valid_questions()
-    questions_by_id = {str(item["task_id"]): item for item in questions}
-    check_task_ids = os.getenv("CHECK_TASK_IDS", "").strip()
-    if check_task_ids:
-        preferred_task_ids = [
-            task_id.strip()
-            for task_id in check_task_ids.split(",")
-            if task_id.strip()
-        ]
-        preferred_questions = [
-            questions_by_id[task_id]
-            for task_id in preferred_task_ids
-            if task_id in questions_by_id
-        ]
-        return preferred_questions[:CHECK_QUESTION_LIMIT]
-
-    return questions[:CHECK_QUESTION_LIMIT]
-
-
-async def summarize_file_questions() -> str:
-    supported = await get_supported_file_questions()
-    all_file_questions = [
-        item
-        for item in await get_questions()
-        if item.get("task_id") and item.get("question") and item.get("file_name")
-    ]
-    unsupported = [
-        item
-        for item in all_file_questions
-        if file_extension(str(item.get("file_name", ""))) in UNSUPPORTED_FILE_EXTENSIONS
-    ]
-    selected = supported[:CHECK_QUESTION_LIMIT]
-    lines = [
-        f"Selected supported file tasks: {len(selected)}/{len(supported)}",
-        f"Skipped unsupported audio tasks: {len(unsupported)}",
-        "",
-    ]
-    for index, item in enumerate(selected, start=1):
-        question = str(item.get("question", "")).replace("\n", " ")
-        lines.append(
-            f"{index}. {item.get('task_id')} | {item.get('file_name')} | {question[:140]}"
-        )
-    if unsupported:
-        lines.extend(["", "Unsupported audio tasks:"])
-        for item in unsupported:
-            lines.append(f"- {item.get('task_id')} | {item.get('file_name')}")
-    return "\n".join(lines)
-
-
-async def summarize_check_questions() -> str:
-    selected = await get_check_questions()
-    lines = [
-        f"Question mode: {CHECK_QUESTION_MODE}",
-        f"Selected questions: {len(selected)}",
-        f"Question limit: {CHECK_QUESTION_LIMIT}",
-        "Parallel workers: unlimited async tasks",
-        "",
-    ]
-    for index, item in enumerate(selected, start=1):
-        question = str(item.get("question", "")).replace("\n", " ")
-        file_name = str(item.get("file_name", ""))
-        suffix = f" | {file_name}" if file_name else ""
-        lines.append(
-            f"{index}. {item.get('task_id')}{suffix} | {question[:140]}"
-        )
-    return "\n".join(lines)
-
-
-async def preview_file_tasks() -> tuple[str, str]:
-    return "Question preview loaded.", await summarize_check_questions()
-
-
-def question_label(item: dict[str, str], index: int) -> str:
-    task_id = str(item.get("task_id", ""))
-    return str(item.get("label") or item.get("name") or f"Question {index}: {task_id}")
 
 
 def build_agent_question(task_id: str, question: str, file_name: str = "") -> str:
@@ -205,23 +46,12 @@ def build_agent_question(task_id: str, question: str, file_name: str = "") -> st
     if file_name:
         metadata.append(f"Attached file: {file_name}")
         metadata.append(
-            "Use the relevant file tool when the answer depends on this attachment.")
-
+            "Use the relevant file tool when the answer depends on this attachment."
+        )
     return "\n".join([*metadata, "", "Question:", question])
 
 
-def build_agent_code_url(agent_code: str) -> str:
-    if agent_code.strip():
-        return agent_code.strip()
-
-    space_id = os.getenv("SPACE_ID")
-    if space_id:
-        return f"https://huggingface.co/spaces/{space_id}/tree/main"
-
-    return "local-development"
-
-
-def create_check_agent() -> GaiaAgent:
+def create_agent() -> GaiaAgent:
     return GaiaAgent(
         model=CHECK_MODEL,
         action_max_tokens=CHECK_ACTION_MAX_TOKENS,
@@ -230,183 +60,236 @@ def create_check_agent() -> GaiaAgent:
     )
 
 
-@traceable(name="run_single_question")
-async def run_single_question(
-    label: str,
-    task_id: str,
-    question: str,
-    file_name: str = "",
-    agent: GaiaAgent | None = None,
-) -> dict[str, object]:
-    agent_question = build_agent_question(task_id, question, file_name)
-    result = await (agent or create_check_agent()).arun(agent_question)
-    return {
-        "label": label,
-        "task_id": task_id,
-        "file_name": file_name,
-        "question": question,
-        "answer": result["answer"].strip(),
-        "reasoning": result.get("reasoning", ""),
-        "steps": result["steps"],
-        "observations": result["observations"],
-        "search_query": result["search_query"],
-        "search_results": result["search_results"],
-        "page_url": result["page_url"],
-        "page_content": result["page_content"],
-    }
-
-
-def failed_question_run(
-    label: str,
-    task_id: str,
-    question: str,
-    error: Exception,
-    file_name: str = "",
-) -> dict[str, object]:
-    return {
-        "label": label,
-        "task_id": task_id,
-        "file_name": file_name,
-        "question": question,
-        "answer": "",
-        "reasoning": "",
-        "steps": [f"error:{type(error).__name__}: {error}"],
-        "observations": [],
-        "search_query": "",
-        "search_results": "",
-        "page_url": "",
-        "page_content": "",
-    }
-
-
-async def run_check_question(index: int, item: dict[str, str]) -> dict[str, object]:
+async def run_one_question(agent: GaiaAgent, item: dict) -> dict:
+    task_id = item.get("task_id")
+    question_text = item.get("question")
+    file_name = str(item.get("file_name") or "")
     started_at = time.monotonic()
-    label = question_label(item, index)
-    task_id = str(item["task_id"])
-    question = str(item["question"])
-    file_name = str(item.get("file_name", ""))
     try:
-        run = await run_single_question(label, task_id, question, file_name)
-        run["status"] = "completed"
-        run["duration_seconds"] = round(time.monotonic() - started_at, 2)
-        return run
+        agent_question = build_agent_question(str(task_id), str(question_text), file_name)
+        result = await asyncio.wait_for(
+            agent.arun(agent_question),
+            timeout=QUESTION_TIMEOUT_SECONDS,
+        )
+        answer = str(result.get("answer", "")).strip()
+        return {
+            "Task ID": task_id,
+            "Question": question_text,
+            "Submitted Answer": answer,
+            "Status": "ok",
+            "Duration (s)": round(time.monotonic() - started_at, 2),
+        }
     except Exception as error:
-        run = failed_question_run(label, task_id, question, error, file_name)
-        run["status"] = "failed"
-        run["duration_seconds"] = round(time.monotonic() - started_at, 2)
-        return run
+        return {
+            "Task ID": task_id,
+            "Question": question_text,
+            "Submitted Answer": f"AGENT ERROR: {type(error).__name__}: {error}",
+            "Status": "error",
+            "Duration (s)": round(time.monotonic() - started_at, 2),
+        }
 
 
-@traceable(name="run_selected_questions_parallel")
-async def run_selected_questions_parallel() -> dict[str, object]:
-    username = os.getenv("HF_USERNAME", "sorin-artem").strip()
-    agent_code = build_agent_code_url(os.getenv("AGENT_CODE_URL", ""))
-    questions = await get_check_questions()
-    indexed_questions = list(enumerate(questions, start=1))
-
-    async def run_with_limit(index: int, item: dict[str, str]) -> dict[str, object]:
-        try:
-            return await asyncio.wait_for(
-                run_check_question(index, item),
-                timeout=CHECK_QUESTION_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError as error:
-            task_id = str(item["task_id"])
-            question = str(item["question"])
-            file_name = str(item.get("file_name", ""))
-            run = failed_question_run(
-                question_label(item, index),
-                task_id,
-                question,
-                error,
-                file_name,
-            )
-            run["status"] = "timeout"
-            run["duration_seconds"] = CHECK_QUESTION_TIMEOUT_SECONDS
-            return run
-
-    runs = await asyncio.gather(
-        *[
-            run_with_limit(index, item)
-            for index, item in indexed_questions
-        ]
+async def run_all_questions(agent: GaiaAgent, questions_data: list[dict]) -> list[dict]:
+    return await asyncio.gather(
+        *[run_one_question(agent, item) for item in questions_data]
     )
 
-    answers_payload = [
-        {
-            "task_id": str(run["task_id"]),
-            "submitted_answer": str(run["answer"]),
-        }
-        for run in runs
-    ]
-    payload = {
-        "username": username,
+
+def run_async(coro):
+    """Run async work from a sync Gradio callback, even if a loop is already running."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+def run_and_submit_all(profile: gr.OAuthProfile | None):
+    """
+    Fetches all questions, runs the GaiaAgent on them, submits all answers,
+    and displays the results — same flow as Final_Assignment_Template.
+    """
+    space_id = os.getenv("SPACE_ID")
+
+    if profile:
+        username = f"{profile.username}"
+        print(f"User logged in: {username}")
+    else:
+        # Local fallback when OAuth is unavailable outside HF Spaces.
+        username = os.getenv("HF_USERNAME", "").strip()
+        if not username:
+            print("User not logged in.")
+            return "Please Login to Hugging Face with the button.", None
+        print(f"User not logged in via OAuth; using HF_USERNAME={username}")
+
+    api_url = DEFAULT_API_URL
+    questions_url = f"{api_url}/questions"
+    submit_url = f"{api_url}/submit"
+
+    try:
+        agent = create_agent()
+    except Exception as e:
+        print(f"Error instantiating agent: {e}")
+        return f"Error initializing agent: {e}", None
+
+    if space_id:
+        agent_code = f"https://huggingface.co/spaces/{space_id}/tree/main"
+    else:
+        agent_code = os.getenv(
+            "AGENT_CODE_URL",
+            "https://huggingface.co/spaces/agents-course/Final_Assignment_Template/tree/main",
+        )
+    print(agent_code)
+
+    print(f"Fetching questions from: {questions_url}")
+    try:
+        response = requests.get(questions_url, timeout=15)
+        response.raise_for_status()
+        questions_data = response.json()
+        if not questions_data:
+            print("Fetched questions list is empty.")
+            return "Fetched questions list is empty or invalid format.", None
+        print(f"Fetched {len(questions_data)} questions.")
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching questions: {e}")
+        return f"Error fetching questions: {e}", None
+    except requests.exceptions.JSONDecodeError as e:
+        print(f"Error decoding JSON response from questions endpoint: {e}")
+        print(f"Response text: {response.text[:500]}")
+        return f"Error decoding server response for questions: {e}", None
+    except Exception as e:
+        print(f"An unexpected error occurred fetching questions: {e}")
+        return f"An unexpected error occurred fetching questions: {e}", None
+
+    print(f"Running agent on {len(questions_data)} questions in parallel...")
+    results_log = run_async(run_all_questions(agent, questions_data))
+
+    answers_payload = []
+    for row in results_log:
+        task_id = row.get("Task ID")
+        submitted_answer = row.get("Submitted Answer", "")
+        if not task_id:
+            continue
+        if str(submitted_answer).startswith("AGENT ERROR:"):
+            submitted_answer = ""
+        answers_payload.append(
+            {"task_id": task_id, "submitted_answer": submitted_answer}
+        )
+
+    results_df = pd.DataFrame(results_log)
+    if not answers_payload:
+        print("Agent did not produce any answers to submit.")
+        return "Agent did not produce any answers to submit.", results_df
+
+    submission_data = {
+        "username": username.strip(),
         "agent_code": agent_code,
         "answers": answers_payload,
     }
-
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(f"{API_URL}/submit", json=payload)
-            response.raise_for_status()
-            submission_result = response.json()
-    except Exception as error:
-        submission_result = {
-            "score": "N/A",
-            "correct_count": "?",
-            "total_attempted": len(answers_payload),
-            "message": f"Submission failed: {type(error).__name__}: {error}",
-        }
-    return {
-        "submission_result": submission_result,
-        "answers": answers_payload,
-        "runs": runs,
-        "settings": {
-            "model": CHECK_MODEL,
-            "question_limit": CHECK_QUESTION_LIMIT,
-            "concurrency": "unlimited_async_tasks",
-            "question_timeout_seconds": CHECK_QUESTION_TIMEOUT_SECONDS,
-            "action_max_tokens": CHECK_ACTION_MAX_TOKENS,
-            "answer_max_tokens": CHECK_ANSWER_MAX_TOKENS,
-            "max_steps": CHECK_MAX_STEPS,
-        },
-    }
-
-
-async def run_and_check_selected_questions() -> tuple[str, str]:
-    result = await run_selected_questions_parallel()
-    submission_result = result["submission_result"]
-    status = (
-        f"Score: {submission_result.get('score', 'N/A')}% "
-        f"({submission_result.get('correct_count', '?')}/"
-        f"{submission_result.get('total_attempted', '?')} correct)\n"
-        f"Message: {submission_result.get('message', 'No message')}"
+    status_update = (
+        f"Agent finished. Submitting {len(answers_payload)} answers "
+        f"for user '{username}'..."
     )
-    return status, json.dumps(result, indent=2, ensure_ascii=False)
+    print(status_update)
+
+    print(f"Submitting {len(answers_payload)} answers to: {submit_url}")
+    try:
+        response = requests.post(submit_url, json=submission_data, timeout=60)
+        response.raise_for_status()
+        result_data = response.json()
+        final_status = (
+            f"Submission Successful!\n"
+            f"User: {result_data.get('username')}\n"
+            f"Overall Score: {result_data.get('score', 'N/A')}% "
+            f"({result_data.get('correct_count', '?')}/"
+            f"{result_data.get('total_attempted', '?')} correct)\n"
+            f"Message: {result_data.get('message', 'No message received.')}"
+        )
+        print("Submission successful.")
+        return final_status, results_df
+    except requests.exceptions.HTTPError as e:
+        error_detail = f"Server responded with status {e.response.status_code}."
+        try:
+            error_json = e.response.json()
+            error_detail += f" Detail: {error_json.get('detail', e.response.text)}"
+        except requests.exceptions.JSONDecodeError:
+            error_detail += f" Response: {e.response.text[:500]}"
+        status_message = f"Submission Failed: {error_detail}"
+        print(status_message)
+        return status_message, results_df
+    except requests.exceptions.Timeout:
+        status_message = "Submission Failed: The request timed out."
+        print(status_message)
+        return status_message, results_df
+    except requests.exceptions.RequestException as e:
+        status_message = f"Submission Failed: Network error - {e}"
+        print(status_message)
+        return status_message, results_df
+    except Exception as e:
+        status_message = f"An unexpected error occurred during submission: {e}"
+        print(status_message)
+        return status_message, results_df
 
 
 with gr.Blocks() as demo:
-    gr.Markdown("# General Tool Agent")
+    gr.Markdown("# GAIA Agent Evaluation Runner")
     gr.Markdown(
-        "Runs selected questions in parallel, then submits the answers to the "
-        "Hugging Face scoring API. Configure CHECK_QUESTION_MODE=all, no_audio, "
-        "or file_supported."
+        """
+**Instructions:**
+
+1. Deploy this as a Hugging Face Space (or run locally), with `OPEN_ROUTER_API_KEY` set.
+2. Log in to your Hugging Face account using the button below. This uses your HF username for submission.
+3. Click **Run Evaluation & Submit All Answers** to fetch questions, run the agent, submit answers, and see the score.
+
+---
+**Disclaimers:**
+Once you click submit, it can take quite some time (the agent goes through all questions in parallel).
+Keep your Space public so the leaderboard can link to your code.
+"""
     )
-    preview_button = gr.Button("Preview selected questions")
-    submit_button = gr.Button("Run selected questions and check")
-    submit_status_output = gr.Textbox(label="Check result", lines=3)
-    submit_log_output = gr.Code(label="Run log", language="json", lines=20)
-    preview_button.click(
-        fn=preview_file_tasks,
-        inputs=None,
-        outputs=[submit_status_output, submit_log_output],
+
+    gr.LoginButton()
+
+    run_button = gr.Button("Run Evaluation & Submit All Answers")
+    status_output = gr.Textbox(
+        label="Run Status / Submission Result", lines=5, interactive=False
     )
-    submit_button.click(
-        fn=run_and_check_selected_questions,
-        inputs=None,
-        outputs=[submit_status_output, submit_log_output],
+    results_table = gr.DataFrame(label="Questions and Agent Answers", wrap=True)
+
+    run_button.click(
+        fn=run_and_submit_all,
+        outputs=[status_output, results_table],
     )
 
 
 if __name__ == "__main__":
-    demo.launch()
+    print("\n" + "-" * 30 + " App Starting " + "-" * 30)
+    space_host_startup = os.getenv("SPACE_HOST")
+    space_id_startup = os.getenv("SPACE_ID")
+
+    if space_host_startup:
+        print(f"✅ SPACE_HOST found: {space_host_startup}")
+        print(f"   Runtime URL should be: https://{space_host_startup}.hf.space")
+    else:
+        print("ℹ️ SPACE_HOST environment variable not found (running locally?).")
+
+    if space_id_startup:
+        print(f"✅ SPACE_ID found: {space_id_startup}")
+        print(f"   Repo URL: https://huggingface.co/spaces/{space_id_startup}")
+        print(
+            f"   Repo Tree URL: https://huggingface.co/spaces/{space_id_startup}/tree/main"
+        )
+    else:
+        print(
+            "ℹ️ SPACE_ID environment variable not found (running locally?). "
+            "Repo URL cannot be determined."
+        )
+
+    print("-" * (60 + len(" App Starting ")) + "\n")
+    print("Launching Gradio Interface for GAIA Agent Evaluation...")
+    # SSR is experimental on Spaces and can crash the Node side after startup.
+    demo.launch(debug=True, share=False, ssr_mode=False)
