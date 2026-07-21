@@ -20,6 +20,8 @@ Final assignment agent for the Hugging Face Agents Course (Unit 4).
 ```bash
 pip install -r requirements.txt
 export OPEN_ROUTER_API_KEY=your_key
+export OPENROUTER_MODEL=minimax/minimax-m3
+export OPENROUTER_VISION_MODEL=minimax/minimax-m3
 # optional local submit without OAuth:
 export HF_USERNAME=your-hf-username
 export AGENT_CODE_URL=https://huggingface.co/spaces/your-username/your-space/tree/main

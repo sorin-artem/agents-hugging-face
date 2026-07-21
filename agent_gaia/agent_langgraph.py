@@ -133,7 +133,7 @@ class GaiaAgent:
             base_url="https://openrouter.ai/api/v1",
         )
         self.model = model or os.getenv(
-            "OPENROUTER_MODEL", "z-ai/glm-5.2")
+            "OPENROUTER_MODEL", "minimax/minimax-m3")
         # Omitting max_tokens does NOT mean unlimited: the provider then applies its
         # own small default and truncates long reasoning mid-sentence (e.g. the
         # spreadsheet task got cut before finishing the last column). So we set a
@@ -144,8 +144,8 @@ class GaiaAgent:
         self.answer_max_tokens = self._resolve_max_tokens(
             answer_max_tokens, "OPENROUTER_ANSWER_MAX_TOKENS", default=12000)
         self.max_steps = max_steps or int(os.getenv("AGENT_MAX_STEPS", "8"))
-        # Reasoning models (e.g. z-ai/glm-5.2) can loop forever in their hidden
-        # reasoning channel on hard tasks and never emit visible content, burning
+        # Some reasoning models can loop forever in their hidden reasoning
+        # channel on hard tasks and never emit visible content, burning
         # the whole token budget for an empty answer. Keeping the hidden channel
         # off makes the model reason in plain text (which we already ask for) and
         # stop cleanly. Set OPENROUTER_REASONING=on to re-enable the hidden channel.

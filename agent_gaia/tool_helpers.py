@@ -529,7 +529,7 @@ def _guess_image_mime(content: bytes, content_type: str) -> str:
 def _vision_model() -> str:
     return os.getenv(
         "OPENROUTER_VISION_MODEL",
-        "google/gemini-2.5-flash",
+        "minimax/minimax-m3",
     )
 
 

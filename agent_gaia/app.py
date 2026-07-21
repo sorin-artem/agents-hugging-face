@@ -22,8 +22,8 @@ def _zero_gpu_placeholder() -> str:
 
 # --- Constants ---
 DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
-QUESTION_TIMEOUT_SECONDS = int(os.getenv("CHECK_QUESTION_TIMEOUT_SECONDS", "300"))
-CHECK_MODEL = os.getenv("CHECK_OPENROUTER_MODEL", os.getenv("OPENROUTER_MODEL", "z-ai/glm-5.2"))
+QUESTION_TIMEOUT_SECONDS = int(os.getenv("CHECK_QUESTION_TIMEOUT_SECONDS", "180"))
+CHECK_MODEL = os.getenv("CHECK_OPENROUTER_MODEL", os.getenv("OPENROUTER_MODEL", "minimax/minimax-m3"))
 CHECK_MAX_STEPS = int(os.getenv("CHECK_AGENT_MAX_STEPS", os.getenv("AGENT_MAX_STEPS", "8")))
 
 
@@ -60,11 +60,12 @@ def create_agent() -> GaiaAgent:
     )
 
 
-async def run_one_question(agent: GaiaAgent, item: dict) -> dict:
+async def run_one_question(agent: GaiaAgent, item: dict, index: int, total: int) -> dict:
     task_id = item.get("task_id")
     question_text = item.get("question")
     file_name = str(item.get("file_name") or "")
     started_at = time.monotonic()
+    print(f"[{index}/{total}] start task_id={task_id}")
     try:
         agent_question = build_agent_question(str(task_id), str(question_text), file_name)
         result = await asyncio.wait_for(
@@ -72,26 +73,37 @@ async def run_one_question(agent: GaiaAgent, item: dict) -> dict:
             timeout=QUESTION_TIMEOUT_SECONDS,
         )
         answer = str(result.get("answer", "")).strip()
+        duration = round(time.monotonic() - started_at, 2)
+        print(f"[{index}/{total}] done task_id={task_id} in {duration}s answer={answer[:80]!r}")
         return {
             "Task ID": task_id,
             "Question": question_text,
             "Submitted Answer": answer,
             "Status": "ok",
-            "Duration (s)": round(time.monotonic() - started_at, 2),
+            "Duration (s)": duration,
         }
     except Exception as error:
+        duration = round(time.monotonic() - started_at, 2)
+        print(
+            f"[{index}/{total}] error task_id={task_id} in {duration}s: "
+            f"{type(error).__name__}: {error}"
+        )
         return {
             "Task ID": task_id,
             "Question": question_text,
             "Submitted Answer": f"AGENT ERROR: {type(error).__name__}: {error}",
             "Status": "error",
-            "Duration (s)": round(time.monotonic() - started_at, 2),
+            "Duration (s)": duration,
         }
 
 
 async def run_all_questions(agent: GaiaAgent, questions_data: list[dict]) -> list[dict]:
+    total = len(questions_data)
     return await asyncio.gather(
-        *[run_one_question(agent, item) for item in questions_data]
+        *[
+            run_one_question(agent, item, index, total)
+            for index, item in enumerate(questions_data, start=1)
+        ]
     )
 
 
@@ -165,7 +177,10 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
         print(f"An unexpected error occurred fetching questions: {e}")
         return f"An unexpected error occurred fetching questions: {e}", None
 
-    print(f"Running agent on {len(questions_data)} questions in parallel...")
+    print(
+        f"Running agent on {len(questions_data)} questions in parallel "
+        f"(timeout={QUESTION_TIMEOUT_SECONDS}s, model={CHECK_MODEL})..."
+    )
     results_log = run_async(run_all_questions(agent, questions_data))
 
     answers_payload = []
@@ -247,7 +262,8 @@ with gr.Blocks() as demo:
 
 ---
 **Disclaimers:**
-Once you click submit, it can take quite some time (the agent goes through all questions in parallel).
+Once you click submit, it can take quite some time
+(the agent goes through all questions in parallel).
 Keep your Space public so the leaderboard can link to your code.
 """
     )
